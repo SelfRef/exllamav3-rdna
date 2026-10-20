@@ -19,13 +19,16 @@ Default branch `rdna`; `master` mirrors upstream.
 | 2 | Shared-input and **sliced** projection bundles (MLP gate/up, attention q/k/v/g, Gated DeltaNet qkv/z) as one input-transform launch plus one matmul launch, `blockIdx.z` per entry; sliced Q/K/V bundles re-enabled on gfx11 (`EXL3_QKV_SLICE`) | `EXL3_RDNA3_GEMM` | 37.8 -> 36.4 ms (-3.7 %) |
 | 3 | HIP flash-decoding split kernels for the graphed decode / verify path (`rocm/rdna3_attn.cu`): q_len 1 with `v_dot2` scores and online softmax; q_len 2-8 on an 8-bit cache with `v_wmma_f32_16x16x16_f16` for QK^T and PV. Same arguments and partial layout as the Triton split kernel (adapted to upstream's dense row packing), so the Triton combine kernel reduces it | `EXL3_RDNA3_ATTN`, `EXL3_RDNA3_ATTN_SPLIT_MULT` (16) | round at 8k context 39.3 -> 36.9 ms (-6 %), at 32k 47.8 -> 40.1 ms (-16 %) |
 | 4 | fp32-output GEMMs that the WMMA GEMM's gfx1100 table declines run as an fp16 product plus a widening copy (rocBLAS has no matrix-core solution for fp16 x fp16 -> fp32 on gfx11). Not under graph capture | `EXL3_RDNA3_HGEMM_WIDEN` | 300-token prefill 644 -> 343 ms; 2000 tokens unchanged |
+| 5 | Fewer launches per decode step: `silu(gate) * up`, the attention output gate and the Gated DeltaNet gated RMSNorm folded into the next matmul's input transform; the RMSNorm in front of a projection bundle writes that bundle's input transform in its tail; the gate/up matmul's epilogue writes the down projection's | `EXL3_FUSE_ACT`, `EXL3_FUSE_GNORM`, `EXL3_FUSE_NORM_HAD`, `EXL3_ACT_EPI` | kernels per generation 66.8k -> 51.1k; round 36.1 -> 35.5 ms (8k: 36.85 -> 36.3) |
+| 6 | Gated DeltaNet b/a projection: all token rows from one pass over the weights, 16-byte loads, `v_dot2_f32_f16` (upstream's kernel re-reads the 1 MB weight per token with 4-byte loads: 23 us -> 4.5 us per call). New in this branch | `EXL3_RDNA_BA_GEMV` | round 35.5 -> 34.8 ms (8k: 36.3 -> 35.6) |
 
-All four are runtime-gated to gfx11 devices; anything else keeps upstream's paths.
+All of them are runtime-gated to gfx11 devices; anything else keeps upstream's paths.
 
 Numerics: 1-3 change the accumulation order of decode-path matmuls / attention. Decode logits against
 upstream's own kernels: KL 3.8e-5 (matmul) / 8.4e-5 (with bundles), top-1 agreement 100 %, and both
 builds sit at the same distance from a full-forward reference. Greedy text is unchanged on most prompts.
-4 rounds residual-stream projections to fp16 during prefill (logit KL 2.6e-4, top-1 100 %).
+4 rounds residual-stream projections to fp16 during prefill (logit KL 2.6e-4, top-1 100 %). 5 is
+byte-identical for the norm hand-off; 6 moves decode logits by KL 7.9e-6.
 
 ### Measured
 
@@ -35,7 +38,7 @@ torch 2.13.0+rocm7.2. In-process, greedy, median ms per speculative round on the
 | | short prompts | 8k context | 32k context | VRAM (served, 196k cache) |
 |---|---|---|---|---|
 | upstream `a3bfbfd` | 39.6 | 42.6 | 47.8 | 22.3 G |
-| this branch | 36.1 | 36.8 | 40.1 | 22.5 G |
+| this branch | 34.8 | 35.6 | — | 22.6 G |
 | exllamav3-rocm `360c902` | 34.6 | 36.3 | — | 24.4 G |
 
 Served through TabbyAPI (decode t/s; prompt processing t/s):
@@ -43,21 +46,21 @@ Served through TabbyAPI (decode t/s; prompt processing t/s):
 | | prose | json | refactor | reasoning | 8k: prefill / decode | 30k prefill | prose prompt |
 |---|---|---|---|---|---|---|---|
 | upstream `a3bfbfd` | 59.1 | 163.4 | 197.5 | 135.4 | 1110 / 66.1 | 1138 | 325 |
-| this branch | 64.8-75.2 | 169.9-182.8 | 215.7-219.6 | 153.1-157.0 | 1271-1310 / 72.3-77.0 | 1224-1231 | 592 |
+| this branch | 75.3 | 175.6 | **225.1** | 160.2 | 1299 / **83.9** | 1232 | 596 |
 | exllamav3-rocm `360c902` | 67.5 | 184.7 | 219.9 | 158.7 | 1217 / 81.3 | 1147 | 563 |
 
-(Served decode depends on the greedy text, which differs between builds; the round times above are the
-like-for-like number.)
+Served decode depends on the greedy text, which differs between builds; refactor and the 8k row produce
+byte-identical text on both, so those two are like for like. VRAM served: 22.6 vs 24.4 GB.
 
-## Where the remaining gap is
+## What is still left
 
-The GPU does the same work per round as exllamav3-rocm (1637 vs 1638 ms busy over the same generation),
-but launches ~1300 kernels per round against ~730: the port fused the matmul input transform into the
-preceding RMSNorm / activation / gated norm, `silu(gate) * up` and the attention output gate into
-matmul prologues, the Gated DeltaNet decode step into one megakernel, and residual adds into the next
-norm. At ~3 us per dependent launch that is the remaining ~1.5 ms per round. Those fusions live in
-the graph-captured module paths, which upstream has reworked since the port branched; they are the
-next round of work.
+Per generation this branch launches ~51k kernels against exllamav3-rocm's ~37k for the same GPU work
+(1594 vs 1638 ms busy): the remaining Gated DeltaNet decode kernels (the port runs b/a, conv and the
+recurrence as one megakernel, written for a recurrent-state layout and rollback scheme upstream no longer
+has), residual adds (the port defers them into the next norm) and per-round sampling launches. Together
+they are worth about the 0.2 ms per round still separating the two on short prompts. Next candidates,
+each under 1 %: residual-add deferral, batched verification sampling, a cheaper draft lm_head (the 6-bit
+248k-vocabulary head is ~1.1 ms of every round).
 
 ## Tried and dropped
 
@@ -65,6 +68,7 @@ next round of work.
 |---|---|
 | The port's Gated DeltaNet register-resident recurrence | upstream now carries the state slice in registers itself (`0f685aa9`) and re-advances from one initial state instead of writing per-token history (`3a8e2fb8`), which was the port's own bottleneck |
 | The port's sliding-window skip in the decode split kernel | upstream has it |
+| The port's fused-megakernel Gated DeltaNet step | written against the old recurrent-state format and per-token history; 6 alone brings the DeltaNet decode time per round to the port's (~2.2 vs ~2.3 ms) |
 | `EXL3_GRAPHS=1` on top of upstream | no difference in speed or VRAM; the port's `EXL3_NOGRAPH=mlp,gdn,attn` saves ~0.2 GB there, so graphs are not where its extra 2 GB goes |
 
 ## Build
