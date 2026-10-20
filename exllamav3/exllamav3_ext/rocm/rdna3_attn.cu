@@ -706,6 +706,10 @@ void rdna3_attn_verify_wmma_kernel
     void* scratch1
 )
 {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__GFX11__)
+    // WMMA (v_wmma_f32_16x16x16_f16, wave32) is gfx11 only; the dispatcher never selects this kernel elsewhere
+    return;
+#else
     using namespace rdna3_attn;
     constexpr int NTH = 256;
     constexpr int W = 8;
@@ -1040,6 +1044,7 @@ void rdna3_attn_verify_wmma_kernel
         partial_ml[(pbase * BLOCK_ROWS + r16) * 2] = mrow[gr];
         partial_ml[(pbase * BLOCK_ROWS + r16) * 2 + 1] = lrow[gr];
     }
+#endif
 }
 
 typedef void (*fp_rdna3_attn)(const half*, const void*, const void*, const int*, const int*, half*, float*, float*,
