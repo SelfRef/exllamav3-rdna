@@ -8,6 +8,19 @@
 #include "../quant/exl3_gemm.cuh"
 #include "../activation.cuh"
 #include "../add.cuh"
+#include <cstdlib>
+#if defined(USE_ROCM)
+    #include "../rocm/quant/exl3_rdna3_fused.cuh"
+    #include "../rocm/quant/exl3_rdna3.cuh"
+#endif
+#if defined(USE_ROCM)
+// RDNA3: elementwise op before a matmul folded into the matmul's input transform
+static bool rdna3_fuse_env(const char* name)
+{
+    const char* e = std::getenv(name);
+    return !(e && e[0] == '0');
+}
+#endif
 
 using namespace torch::indexing;
 
@@ -37,6 +50,13 @@ void BC_GatedMLP::run_bszN_gr
 
     if (gu_ptrs_trellis)
     {
+#if defined(USE_ROCM)
+        // RDNA3: the gate/up matmul also writes the down projection's input transform of silu(g) * u, so
+        // the fused down projection below skips its input kernel (eager only: the hand-off is not graphed)
+        static const bool fuse_act_epi = rdna3_fuse_env("EXL3_FUSE_ACT") && rdna3_fuse_env("EXL3_ACT_EPI");
+        const bool act_epi = fuse_act_epi && !graph && act_silu && act_limit == 0.0f;
+        if (act_epi) exl3_rdna3_arm_act_epilogue(x.device().index(), down->suh.data_ptr());
+#endif
         exl3_mgemm_gr
         (
             x,
@@ -58,6 +78,9 @@ void BC_GatedMLP::run_bszN_gr
             1   // mgemm's reduction-group param, unused here (no weights -> no reduction runs);
                 // bszm=2 is the gate/up slot pair, unrelated to num_tokens (carried via size_m)
         );
+#if defined(USE_ROCM)
+        if (act_epi) exl3_rdna3_disarm_act_epilogue(x.device().index());
+#endif
     }
     else
     {
@@ -78,14 +101,24 @@ void BC_GatedMLP::run_bszN_gr
     at::Tensor g = gu_n.select(0, 0).unsqueeze(0);
     at::Tensor u = gu_n.select(0, 1).unsqueeze(0);
 
-    if (act_silu)
+    // RDNA3: silu(g) * u folded into the down projection's input transform (EXL3_FUSE_ACT=0 disables)
+    bool fused_act = false;
+#if defined(USE_ROCM)
+    static const bool fuse_act = rdna3_fuse_env("EXL3_FUSE_ACT");
+    fused_act = fuse_act && act_silu && act_limit == 0.0f &&
+        exl3_gemm_silu_gr(g, u, down->trellis, d, down->suh, down->svh, down->mcg, down->mul1, graph);
+#endif
+
+    if (fused_act) {}
+    else if (act_silu)
         silu_mul_gr(g, u, a_n, act_limit, graph);
     else if (act_gelu)
         gelu_mul_gr(g, u, a_n, act_limit, graph);
     else if (act_relu2)
         relu2_mul_gr(g, u, a_n, act_limit, graph);
 
-    exl3_gemm_gr(a_n, down->trellis, d, down->suh, down_xh_n, down->svh, -1, down->mcg, down->mul1, 0, graph);
+    if (!fused_act)
+        exl3_gemm_gr(a_n, down->trellis, d, down->suh, down_xh_n, down->svh, -1, down->mcg, down->mul1, 0, graph);
     if (down->bias)
         add_gr(d, down->bias.value(), d, graph);
 }
