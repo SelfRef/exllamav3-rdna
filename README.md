@@ -1,3 +1,85 @@
+# exllamav3-rdna
+
+**[exllamav3](https://github.com/turboderp-org/exllamav3) for AMD RDNA3 — Radeon RX 7900 XTX (gfx1100),
+and the gfx11 family generally (RX 7800 XT gfx1101, Strix Halo gfx1151 build; benchmarked on the XTX).**
+
+Upstream exllamav3 has had its own ROCm backend since v1.6.0, and it is the base of this branch. Before
+that, [phoenixhaxor/exllamav3-rocm](https://github.com/phoenixhaxor/exllamav3-rocm) ported exllamav3 to
+RDNA3 with hand-written kernels; that port has not moved since 2026-09-26 and cannot be rebased (two
+independent ROCm backends over the same files). Measured on the same card, upstream decoded 10-19 %
+slower than that port while using 2 GB less VRAM. Branch `rdna` is upstream plus the port's kernels that
+still pay off on top of current upstream, each behind a switch and each kept only on a measurement.
+Default branch `rdna`; `master` mirrors upstream.
+
+## What branch `rdna` carries
+
+| # | Change | Switch (default on) | Measured on a 7900 XTX |
+|---|---|---|---|
+| 1 | Split-k small-m EXL3 matmul (`rocm/quant/exl3_rdna3*`): input transform once per matmul, one wave per 16x16 tile column, register prefetch ring on raw buffer loads, RDNA3-tuned `mul1` decode (24-bit multiplies, `v_sad_u8` byte sums, `v_dot2_f32_f16`), direct tile-word loads for 5/6-bit, residency-wave grid sizing. Dispatched ahead of the multirow GEMV for every EXL3 linear up to the reconstruct threshold | `EXL3_RDNA3_GEMM` | DFlash2 round 39.6 -> 37.8 ms (-4.5 %) |
+| 2 | Shared-input and **sliced** projection bundles (MLP gate/up, attention q/k/v/g, Gated DeltaNet qkv/z) as one input-transform launch plus one matmul launch, `blockIdx.z` per entry; sliced Q/K/V bundles re-enabled on gfx11 (`EXL3_QKV_SLICE`) | `EXL3_RDNA3_GEMM` | 37.8 -> 36.4 ms (-3.7 %) |
+| 3 | HIP flash-decoding split kernels for the graphed decode / verify path (`rocm/rdna3_attn.cu`): q_len 1 with `v_dot2` scores and online softmax; q_len 2-8 on an 8-bit cache with `v_wmma_f32_16x16x16_f16` for QK^T and PV. Same arguments and partial layout as the Triton split kernel (adapted to upstream's dense row packing), so the Triton combine kernel reduces it | `EXL3_RDNA3_ATTN`, `EXL3_RDNA3_ATTN_SPLIT_MULT` (16) | round at 8k context 39.3 -> 36.9 ms (-6 %), at 32k 47.8 -> 40.1 ms (-16 %) |
+| 4 | fp32-output GEMMs that the WMMA GEMM's gfx1100 table declines run as an fp16 product plus a widening copy (rocBLAS has no matrix-core solution for fp16 x fp16 -> fp32 on gfx11). Not under graph capture | `EXL3_RDNA3_HGEMM_WIDEN` | 300-token prefill 644 -> 343 ms; 2000 tokens unchanged |
+
+All four are runtime-gated to gfx11 devices; anything else keeps upstream's paths.
+
+Numerics: 1-3 change the accumulation order of decode-path matmuls / attention. Decode logits against
+upstream's own kernels: KL 3.8e-5 (matmul) / 8.4e-5 (with bundles), top-1 agreement 100 %, and both
+builds sit at the same distance from a full-forward reference. Greedy text is unchanged on most prompts.
+4 rounds residual-stream projections to fp16 during prefill (logit KL 2.6e-4, top-1 100 %).
+
+### Measured
+
+Qwen3.8-27B EXL3 3.5 bpw + DFlash2 5.0 bpw draft, Q8 cache (draft Q4), batch 1, ROCm 7.2.4,
+torch 2.13.0+rocm7.2. In-process, greedy, median ms per speculative round on the same prompts:
+
+| | short prompts | 8k context | 32k context | VRAM (served, 196k cache) |
+|---|---|---|---|---|
+| upstream `a3bfbfd` | 39.6 | 42.6 | 47.8 | 22.3 G |
+| this branch | 36.1 | 36.8 | 40.1 | 22.5 G |
+| exllamav3-rocm `360c902` | 34.6 | 36.3 | — | 24.4 G |
+
+Served through TabbyAPI (decode t/s; prompt processing t/s):
+
+| | prose | json | refactor | reasoning | 8k: prefill / decode | 30k prefill | prose prompt |
+|---|---|---|---|---|---|---|---|
+| upstream `a3bfbfd` | 59.1 | 163.4 | 197.5 | 135.4 | 1110 / 66.1 | 1138 | 325 |
+| this branch | 64.8-75.2 | 169.9-182.8 | 215.7-219.6 | 153.1-157.0 | 1271-1310 / 72.3-77.0 | 1224-1231 | 592 |
+| exllamav3-rocm `360c902` | 67.5 | 184.7 | 219.9 | 158.7 | 1217 / 81.3 | 1147 | 563 |
+
+(Served decode depends on the greedy text, which differs between builds; the round times above are the
+like-for-like number.)
+
+## Where the remaining gap is
+
+The GPU does the same work per round as exllamav3-rocm (1637 vs 1638 ms busy over the same generation),
+but launches ~1300 kernels per round against ~730: the port fused the matmul input transform into the
+preceding RMSNorm / activation / gated norm, `silu(gate) * up` and the attention output gate into
+matmul prologues, the Gated DeltaNet decode step into one megakernel, and residual adds into the next
+norm. At ~3 us per dependent launch that is the remaining ~1.5 ms per round. Those fusions live in
+the graph-captured module paths, which upstream has reworked since the port branched; they are the
+next round of work.
+
+## Tried and dropped
+
+| Idea | Why not |
+|---|---|
+| The port's Gated DeltaNet register-resident recurrence | upstream now carries the state slice in registers itself (`0f685aa9`) and re-advances from one initial state instead of writing per-token history (`3a8e2fb8`), which was the port's own bottleneck |
+| The port's sliding-window skip in the decode split kernel | upstream has it |
+| `EXL3_GRAPHS=1` on top of upstream | no difference in speed or VRAM; the port's `EXL3_NOGRAPH=mlp,gdn,attn` saves ~0.2 GB there, so graphs are not where its extra 2 GB goes |
+
+## Build
+
+ROCm 7.2.x and a ROCm build of PyTorch, then `PYTORCH_ROCM_ARCH=gfx1100 python setup.py build_ext
+--inplace` (or `pip install .`); `gfx1100;gfx1101;gfx1151` builds as well. TabbyAPI runs it unchanged.
+
+## Credits
+
+- exllamav3 by turboderp and contributors, MIT.
+- The RDNA3 kernels in 1-4 come from [phoenixhaxor/exllamav3-rocm](https://github.com/phoenixhaxor/exllamav3-rocm)
+  (MIT); their design notes and measurements are in that repository's README.
+
+---
+
 
 <p align="center">
   <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
