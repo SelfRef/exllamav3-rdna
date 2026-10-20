@@ -23,6 +23,14 @@ TritonKernel::TritonKernel(py::bytes cubin, std::string _name, int _num_warps, i
 #endif
 }
 
+TritonKernel::TritonKernel(void* function, std::string _name, int _num_warps, int _shared_bytes) :
+    fn((CUfunction) function),
+    name(std::move(_name)),
+    num_warps(_num_warps),
+    shared_bytes(_shared_bytes)
+{
+}
+
 TritonKernel::~TritonKernel()
 {
     if (mod) CudaDrv::instance().module_unload(mod);
