@@ -1,5 +1,7 @@
 #pragma once
 
+// Ported from phoenixhaxor/exllamav3-rocm (MIT), https://github.com/phoenixhaxor/exllamav3-rocm
+
 // EXL3 small-m matmul for AMD RDNA3 (gfx11, wave32), used in place of the NVIDIA GEMV/GEMM
 // kernels (mma.sync, cp.async, cooperative launch) for m <= AUTO_RECONSTRUCT_THRESHOLD.
 //

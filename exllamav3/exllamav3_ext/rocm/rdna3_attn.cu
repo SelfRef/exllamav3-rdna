@@ -1,3 +1,5 @@
+// Ported from phoenixhaxor/exllamav3-rocm (MIT), https://github.com/phoenixhaxor/exllamav3-rocm
+
 #include <cuda_fp16.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
