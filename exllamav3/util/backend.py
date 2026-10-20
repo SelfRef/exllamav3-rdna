@@ -36,8 +36,18 @@ def _env(name: str, cuda, rocm):
 
 # --- Tuning defaults --------------------------------------------------------------------------------------
 
-# Q/K/V projections as one sliced GEMM bundle (mgemm): the RDNA mgemv has no sliced form
-QKV_SLICE = _env("EXL3_QKV_SLICE", 1, 0) != "0"
+def _rdna3_matmul() -> bool:
+    """ROCm on gfx11 with the RDNA3 split-k matmul (rocm/quant/exl3_rdna3.cu) enabled (EXL3_RDNA3_GEMM)"""
+    if not ROCM or os.environ.get("EXL3_RDNA3_GEMM", "1") == "0" or not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx11")
+
+
+RDNA3_MATMUL = _rdna3_matmul()
+
+# Q/K/V projections as one sliced GEMM bundle (mgemm): the generic RDNA mgemv has no sliced form, the
+# RDNA3 matmul does
+QKV_SLICE = _env("EXL3_QKV_SLICE", 1, 1 if RDNA3_MATMUL else 0) != "0"
 
 # int8-activation GEMV for mul1 tensors at small m (exl3_gemv_int8.cu, which holds the same default): off on
 # ROCm, where the RDNA fdot2 GEMVs are faster at these shapes
