@@ -77,3 +77,16 @@ void rms_norm_gr
     bool span_heads,
     Graph* graph
 );
+
+bool rms_norm_had
+(
+    at::Tensor x,
+    c10::optional<at::Tensor> w,
+    at::Tensor y,
+    c10::optional<at::Tensor> r,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    at::Tensor suh_tab,
+    int num_src
+);

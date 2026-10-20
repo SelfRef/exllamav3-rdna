@@ -1209,6 +1209,17 @@ class GatedDeltaNet(Module):
             self.bc.set_stage_key(bsz, seqlen, True, id(rsl))
 
 
+    def input_bundle(self, x: torch.Tensor):
+        """(suh table, sources) of the sliced qkv + z matmul that consumes x on the BC decode path, for the
+        input norm's fused RDNA3 input transform (RMSNorm had_for); None where that path won't run"""
+        mq = getattr(self, "multi_qkvz", None)
+        if mq is None or not self.bc_split or x.dim() != 3:
+            return None
+        bsz, seqlen = x.shape[0], x.shape[1]
+        if not (1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN) or bsz * seqlen > 32:
+            return None
+        return (mq.ptrs_suh, mq.num_src)
+
     @override
     def forward(
         self,

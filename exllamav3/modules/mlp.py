@@ -845,6 +845,14 @@ class GatedMLP(Module):
         self.load_local(self.device, 0)
 
 
+    def input_bundle(self, x: torch.Tensor):
+        """(suh table, sources) of the fused gate/up matmul that consumes x on the BC decode path, for the
+        input norm's fused RDNA3 input transform (RMSNorm had_for); None where that path won't run"""
+        mgu = self.multi_gu[0] if self.num_slices == 1 else None
+        if self.bc is None or mgu is None or x.numel() // x.shape[-1] > MAX_BSZN:
+            return None
+        return (mgu.ptrs_suh, mgu.num_linears)
+
     @override
     def forward(
         self,

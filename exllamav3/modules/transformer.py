@@ -6,6 +6,21 @@ from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
 from .hyperconnections import HyperConnection, hc_flush
 from ..util import profile_opt
+from ..util.backend import RDNA3_MATMUL
+import os
+
+# RDNA3: an RMSNorm that feeds a fused projection bundle also writes that bundle's matmul input transform
+# (RMSNorm had_for, ext.rms_norm_had); EXL3_FUSE_NORM_HAD=0 disables
+_norm_had_enable = RDNA3_MATMUL and os.environ.get("EXL3_FUSE_NORM_HAD", "1") != "0"
+
+
+def _had_for(module, x):
+    """Input bundle of the module's first fused matmul (RMSNorm had_for); None where not applicable"""
+    if not _norm_had_enable:
+        return None
+    f = getattr(module, "input_bundle", None)
+    return f(x) if f is not None else None
+
 
 class TransformerBlock(Module):
 
@@ -160,7 +175,8 @@ class TransformerBlock(Module):
                 if self.attn_norm and not normed:
                     y = self.attn_norm.forward(y, params, out_dtype = torch.half)
             elif self.attn_norm:
-                y = self.attn_norm.forward(x, params, out_dtype = torch.half)
+                hf = _had_for(self.attn, x) if isinstance(self.attn_norm, RMSNorm) else None
+                y = self.attn_norm.forward(x, params, out_dtype = torch.half, **({"had_for": hf} if hf else {}))
             else:
                 y = x.half()
             y = self.attn.forward(y, params)
@@ -186,9 +202,12 @@ class TransformerBlock(Module):
             else:
                 params["residual"] = x
                 if y_resid is not None:
-                    y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x)
+                    hf = _had_for(self.mlp, x)
+                    y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x,
+                                              **({"had_for": hf} if hf else {}))
                 elif self.mlp_norm:
-                    y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
+                    hf = _had_for(self.mlp, x) if isinstance(self.mlp_norm, RMSNorm) else None
+                    y = self.mlp_norm.forward(x, params, out_dtype = torch.half, **({"had_for": hf} if hf else {}))
                 else:
                     y = x.half()
             y = self.mlp.forward(y, params)
