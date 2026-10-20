@@ -1,5 +1,7 @@
 #include <cuda_fp16.h>
 #include "hgemm.cuh"
+#include <cstdlib>
+#include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
@@ -26,7 +28,8 @@ static void hgemm_gemmex_impl
     at::Tensor a,
     at::Tensor b,
     at::Tensor c,
-    cudaStream_t stream
+    cudaStream_t stream,
+    bool capturing
 )
 {
     TORCH_CHECK(a.is_cuda() && b.is_cuda() && c.is_cuda() &&
@@ -81,6 +84,18 @@ static void hgemm_gemmex_impl
         cuda_check(cudaPeekAtLastError());
         return;
     }
+
+    // What the WMMA GEMM declines with fp32 output would take rocBLAS's non-matrix-core kernels (~16 vs ~80
+    // TFLOPS on gfx11): from 64 rows an fp16 product plus a widening copy is faster (exllamav3-rocm).
+    // Not under graph capture, which cannot allocate the fp16 temporary; EXL3_RDNA3_HGEMM_WIDEN=0 disables
+    static const bool widen = []{ const char* e = std::getenv("EXL3_RDNA3_HGEMM_WIDEN"); return !(e && e[0] == '0'); }();
+    if (widen && !capturing && output_fp32 && size_m >= 64 && c.is_contiguous())
+    {
+        at::Tensor c16 = at::empty(c.sizes(), c.options().dtype(at::kHalf));
+        hgemm_gemmex_impl(a, b, c16, stream, capturing);
+        c.copy_(c16);
+        return;
+    }
 #endif
 
     // Set cuBLAS modes and workspace
@@ -114,7 +129,7 @@ void hgemm_gr
 {
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
-    hgemm_gemmex_impl(a, b, c, stream);
+    hgemm_gemmex_impl(a, b, c, stream, graph != nullptr);
 
     if (graph) graph->need_cublas = true;
 }
