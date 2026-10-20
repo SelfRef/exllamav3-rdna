@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_fp16.hpp>
 #include "activation.cuh"
@@ -1920,6 +1921,108 @@ void gdn_ba_gemv_kernel
     }
 }
 
+#if defined(USE_ROCM)
+// RDNA: b/a projection for all token rows from one pass over the weights. One block per output column, its
+// eight waves split k; 16-byte loads and v_dot2_f32_f16 into a per-row fp32 accumulator, then a block-wide
+// reduction. The generic kernel above re-reads the whole weight once per token row with 4-byte loads (~23 us
+// per call at k = 5120, n = 96 for a 9-token verify step on a 7900 XTX). Same argument layout, so x stays
+// patchable in captured graphs
+#define BA_GEMV_ROWS_MAX 16
+typedef _Float16 ba_hv2 __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ float ba_dot8(uint4 a, uint4 b, float acc)
+{
+    acc = __builtin_amdgcn_fdot2(__builtin_bit_cast(ba_hv2, a.x), __builtin_bit_cast(ba_hv2, b.x), acc, false);
+    acc = __builtin_amdgcn_fdot2(__builtin_bit_cast(ba_hv2, a.y), __builtin_bit_cast(ba_hv2, b.y), acc, false);
+    acc = __builtin_amdgcn_fdot2(__builtin_bit_cast(ba_hv2, a.z), __builtin_bit_cast(ba_hv2, b.z), acc, false);
+    return __builtin_amdgcn_fdot2(__builtin_bit_cast(ba_hv2, a.w), __builtin_bit_cast(ba_hv2, b.w), acc, false);
+}
+
+template <int ROWS>
+__global__ __launch_bounds__(256)
+void gdn_ba_gemv_rows_kernel
+(
+    const half* __restrict__ x,                 // [rows, k]
+    const half* __restrict__ w_t,               // [n, k]
+    const half* __restrict__ bias,              // [n] or null
+    float* __restrict__ y,                      // [rows, n]
+    const int k,
+    const int n
+)
+{
+    __shared__ float red[8][ROWS];
+    const int col = blockIdx.x;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int k8 = k / 8;
+    const uint4* wv = (const uint4*) (w_t + (size_t) col * k);
+    const uint4* xv = (const uint4*) x;
+
+    float acc[ROWS];
+    #pragma unroll
+    for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
+
+    for (int j = threadIdx.x; j < k8; j += 256)
+    {
+        const uint4 b = wv[j];
+        #pragma unroll
+        for (int r = 0; r < ROWS; ++r) acc[r] = ba_dot8(xv[(size_t) r * k8 + j], b, acc[r]);
+    }
+
+    #pragma unroll
+    for (int r = 0; r < ROWS; ++r)
+    {
+        float v = acc[r];
+        for (int offset = 16; offset > 0; offset >>= 1) v += __shfl_xor(v, offset);
+        if (lane == 0) red[warp][r] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < ROWS)
+    {
+        const int r = threadIdx.x;
+        float v = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) v += red[w][r];
+        if (bias) v += __half2float(bias[col]);
+        y[(size_t) r * n + col] = v;
+    }
+}
+
+template <int ROWS>
+static bool ba_gemv_rows_launch(const half* x, const half* w, const half* b, float* y, int rows, int k, int n,
+                                cudaStream_t stream, Graph* graph)
+{
+    if (rows != ROWS) return false;
+    gdn_ba_gemv_rows_kernel<ROWS><<<n, 256, 0, stream>>>(x, w, b, y, k, n);
+    if (graph)
+    {
+        graph->record_param((void*) &gdn_ba_gemv_rows_kernel<ROWS>, GP_gdn_ba_x, 0);
+        graph->record_param((void*) &gdn_ba_gemv_rows_kernel<ROWS>, GP_end, 0);
+    }
+    return true;
+}
+
+static bool gdn_ba_gemv_rows(const half* x, const half* w, const half* b, float* y, int rows, int k, int n,
+                             cudaStream_t stream, Graph* graph)
+{
+    static const bool enable = [] { const char* e = std::getenv("EXL3_RDNA_BA_GEMV"); return !(e && e[0] == '0'); }();
+    if (!enable || rows < 1 || rows > BA_GEMV_ROWS_MAX || k % 8) return false;
+    if (((uintptr_t) x | (uintptr_t) w) % 16) return false;
+    return ba_gemv_rows_launch<1>(x, w, b, y, rows, k, n, stream, graph) ||
+           ba_gemv_rows_launch<2>(x, w, b, y, rows, k, n, stream, graph) ||
+           ba_gemv_rows_launch<3>(x, w, b, y, rows, k, n, stream, graph) ||
+           ba_gemv_rows_launch<4>(x, w, b, y, rows, k, n, stream, graph) ||
+           ba_gemv_rows_launch<5>(x, w, b, y, rows, k, n, stream, graph) ||
+           ba_gemv_rows_launch<6>(x, w, b, y, rows, k, n, stream, graph) ||
+           ba_gemv_rows_launch<7>(x, w, b, y, rows, k, n, stream, graph) ||
+           ba_gemv_rows_launch<8>(x, w, b, y, rows, k, n, stream, graph) ||
+           ba_gemv_rows_launch<9>(x, w, b, y, rows, k, n, stream, graph) ||
+           ba_gemv_rows_launch<10>(x, w, b, y, rows, k, n, stream, graph) ||
+           ba_gemv_rows_launch<12>(x, w, b, y, rows, k, n, stream, graph) ||
+           ba_gemv_rows_launch<16>(x, w, b, y, rows, k, n, stream, graph);
+}
+#endif
+
 void gdn_ba_gemv_gr
 (
     const at::Tensor& x,            // [rows, k] half
@@ -1952,6 +2055,14 @@ void gdn_ba_gemv_gr
     if (rows == 0 || n == 0) return;
 
     const half* bias_ptr = (const half*) OPTPTR(bias);
+#if defined(USE_ROCM)
+    if (gdn_ba_gemv_rows((const half*) x.data_ptr(), (const half*) w_t.data_ptr(), bias_ptr, (float*) y.data_ptr(),
+                         rows, k, n, stream, graph))
+    {
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
+#endif
     dim3 blocks(CEIL_DIVIDE(n, BA_GEMV_WARPS), rows);
 
     gdn_ba_gemv_kernel<<<blocks, BA_GEMV_WARPS * 32, 0, stream>>>
