@@ -14,6 +14,11 @@ import os
 _norm_had_enable = RDNA3_MATMUL and os.environ.get("EXL3_FUSE_NORM_HAD", "1") != "0"
 
 
+# RDNA3: a block's final residual add (x += mlp(x)) is handed to the next block's input RMSNorm, which adds it
+# in the same kernel (rms_norm_res_in); one elementwise launch less per layer. EXL3_RESID_DEFER=0 disables
+resid_defer_enable = RDNA3_MATMUL and os.environ.get("EXL3_RESID_DEFER", "1") != "0"
+
+
 def _had_for(module, x):
     """Input bundle of the module's first fused matmul (RMSNorm had_for); None where not applicable"""
     if not _norm_had_enable:
@@ -168,12 +173,26 @@ class TransformerBlock(Module):
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
 
+        # Previous block's MLP output whose residual add is folded into this block's input norm (forward_ls
+        # sets resid_defer when the next module is a TransformerBlock on the same device)
+        pending = params.pop("resid_pending", None)
+        fuse_in = (
+            pending is not None and self.attn is not None and not self.attn_hc and
+            isinstance(self.attn_norm, RMSNorm) and self.attn_norm.can_fuse_residual(x, pending)
+        )
+        if pending is not None and not fuse_in:
+            x += pending
+
         if self.attn:
             if self.attn_hc:
                 hc_post, hc_comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm)
                 y = y.half()
                 if self.attn_norm and not normed:
                     y = self.attn_norm.forward(y, params, out_dtype = torch.half)
+            elif fuse_in:
+                hf = _had_for(self.attn, x)
+                y = self.attn_norm.forward(pending, params, out_dtype = torch.half, residual_in = x,
+                                           **({"had_for": hf} if hf else {}))
             elif self.attn_norm:
                 hf = _had_for(self.attn, x) if isinstance(self.attn_norm, RMSNorm) else None
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half, **({"had_for": hf} if hf else {}))
@@ -217,6 +236,12 @@ class TransformerBlock(Module):
                 x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.mlp_post_norm:
                 self.mlp_post_norm.forward(y, params, residual = x)
+            elif (
+                params.get("resid_defer") and not export_state and self.layer_scalar_f is None and
+                (out_dtype or self.out_dtype) in (None, x.dtype)
+            ):
+                params["resid_pending"] = y
+                return x
             else:
                 x += y
 
