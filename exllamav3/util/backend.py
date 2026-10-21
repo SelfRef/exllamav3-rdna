@@ -36,6 +36,14 @@ def _env(name: str, cuda, rocm):
 
 # --- Tuning defaults --------------------------------------------------------------------------------------
 
+def reconstruct_threshold(device, default: int) -> int:
+    """Largest row count for which an EXL3 linear runs the quantized matmul; above it the weight is reconstructed to
+    fp16 and multiplied with hgemm. gfx1100 / gfx1101: past the GEMV row counts the quantized matmul has no
+    matrix-core path, while hgemm runs on the WMMA GEMM (rocm/wmma_gemm_table.cuh), so reconstruct + GEMM is faster
+    from 17 rows on (Qwen3.8-27B 3.5 bpw prefill on a 7900 XTX: 24 rows 203 -> 184 ms, 100 rows 651 -> 208 ms)"""
+    return 16 if gfx_arch(device) in ("gfx1100", "gfx1101") else default
+
+
 # Q/K/V projections as one sliced GEMM bundle (mgemm): the RDNA mgemv has no sliced form
 QKV_SLICE = _env("EXL3_QKV_SLICE", 1, 0) != "0"
 
