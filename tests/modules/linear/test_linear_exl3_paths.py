@@ -16,6 +16,7 @@ import torch
 
 from exllamav3.modules import Linear
 from exllamav3.modules.quant.exl3 import AUTO_RECONSTRUCT_THRESHOLD, MAX_RECONSTRUCT_SLICE_N
+from exllamav3.util.backend import reconstruct_threshold
 
 from testlib.checkpoint import module_config
 from testlib.exl3 import CODEBOOKS, checkpoint_tensors, generator, linear_ref
@@ -105,17 +106,19 @@ def test_wide_output_slices(tmp_path, device, K, codebook):
 
 @torch.inference_mode()
 def test_auto_reconstruct_dispatch(tmp_path, device):
-    """{"reconstruct": False} takes the quantized kernels up to AUTO_RECONSTRUCT_THRESHOLD rows and reconstructs
-    past it, unless infer_params.no_reconstruct; {"reconstruct": True} always reconstructs"""
+    """{"reconstruct": False} takes the quantized kernels up to the device's reconstruct threshold
+    (AUTO_RECONSTRUCT_THRESHOLD unless util/backend.py sets one for the architecture) and reconstructs past it, unless
+    infer_params.no_reconstruct; {"reconstruct": True} always reconstructs"""
     k, n = 512, 512
     auto, _ = build(tmp_path / "auto", device, k, n, 4, "mul1", False, seed = 1)
     forced, _ = build(tmp_path / "forced", device, k, n, 4, "mul1", False, seed = 1, no_reconstruct = True)
     spies = {"auto": ReconstructSpy(auto.inner), "forced": ReconstructSpy(forced.inner)}
-    for rows in (1, AUTO_RECONSTRUCT_THRESHOLD, AUTO_RECONSTRUCT_THRESHOLD + 1, 1024):
+    threshold = reconstruct_threshold(torch.device(device), AUTO_RECONSTRUCT_THRESHOLD)
+    for rows in (1, threshold, threshold + 1, 1024):
         x = torch.randn((1, rows, k), device = device).half()
         for name, module in (("auto", auto), ("forced", forced)):
             _, recon = spies[name].took_reconstruct(lambda: module.forward(x, {"reconstruct": False}))
-            expect = name == "auto" and rows > AUTO_RECONSTRUCT_THRESHOLD
+            expect = name == "auto" and rows > threshold
             assert recon == expect, f"{name}, rows {rows}: reconstruct path taken = {recon}"
             _, recon = spies[name].took_reconstruct(lambda: module.forward(x, {"reconstruct": True}))
             assert recon, f"{name}, rows {rows}: reconstruct requested but not taken"

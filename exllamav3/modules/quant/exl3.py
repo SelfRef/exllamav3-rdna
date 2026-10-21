@@ -6,7 +6,9 @@ from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
 import os
 from ...util import profile_opt
+from ...util.backend import reconstruct_threshold
 
+# Default; per-architecture values in util/backend.py (reconstruct_threshold)
 AUTO_RECONSTRUCT_THRESHOLD = 144
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
@@ -81,6 +83,7 @@ class LinearEXL3:
         assert self.frac is None or self.mul1, f"{key}: half-integer bitrate {self.K} requires the mul1 codebook"
 
         self._fused_reconstruct = None
+        self._reconstruct_threshold = None
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
         # K is the bitrate (int, or float for the half-integer rates); the C++ side decomposes it
         self.bc = ext.BC_LinearEXL3(
@@ -137,7 +140,9 @@ class LinearEXL3:
         reconstruct = params.get("reconstruct")
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
-            if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
+            if self._reconstruct_threshold is None:
+                self._reconstruct_threshold = reconstruct_threshold(x.device, AUTO_RECONSTRUCT_THRESHOLD)
+            if rows <= self._reconstruct_threshold or self.config.infer_params.no_reconstruct:
                 dtype = out_dtype or self.default_out_dtype
                 return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 

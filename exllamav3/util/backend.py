@@ -49,6 +49,22 @@ RDNA3_MATMUL = _rdna3_matmul()
 # RDNA3 matmul does
 QKV_SLICE = _env("EXL3_QKV_SLICE", 1, 1 if RDNA3_MATMUL else 0) != "0"
 
+
+def reconstruct_threshold(device, default: int) -> int:
+    """Largest row count for which an EXL3 linear runs the quantized matmul; above it the weight is reconstructed to
+    fp16 and multiplied with hgemm (EXL3_RECONSTRUCT_THRESHOLD overrides). gfx1100 / gfx1101: hgemm runs on the
+    tuned WMMA GEMM; upstream's quantized matmul has no matrix-core path past the GEMV row counts (crossover 16
+    rows), the RDNA3 split-k matmul holds out longer (crossover RDNA3_RECONSTRUCT_THRESHOLD)"""
+    env = os.environ.get("EXL3_RECONSTRUCT_THRESHOLD")
+    if env:
+        return int(env)
+    if gfx_arch(device) not in ("gfx1100", "gfx1101"):
+        return default
+    return RDNA3_RECONSTRUCT_THRESHOLD if RDNA3_MATMUL else 16
+
+
+RDNA3_RECONSTRUCT_THRESHOLD = 80
+
 # int8-activation GEMV for mul1 tensors at small m (exl3_gemv_int8.cu, which holds the same default): off on
 # ROCm, where the RDNA fdot2 GEMVs are faster at these shapes
 INT8_GEMV_MODE = int(_env("EXL3_INT8_GEMV", 2, 0))
