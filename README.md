@@ -20,6 +20,7 @@ Default branch `rdna`; `master` mirrors upstream.
 | 3 | HIP flash-decoding split kernels for the graphed decode / verify path (`rocm/rdna3_attn.cu`): q_len 1 with `v_dot2` scores and online softmax; q_len 2-8 on an 8-bit cache with `v_wmma_f32_16x16x16_f16` for QK^T and PV. Same arguments and partial layout as the Triton split kernel (adapted to upstream's dense row packing), so the Triton combine kernel reduces it | `EXL3_RDNA3_ATTN`, `EXL3_RDNA3_ATTN_SPLIT_MULT` (16) | round at 8k context 39.3 -> 36.9 ms (-6 %), at 32k 47.8 -> 40.1 ms (-16 %) |
 | 4 | fp32-output GEMMs that the WMMA GEMM's gfx1100 table declines run as an fp16 product plus a widening copy (rocBLAS has no matrix-core solution for fp16 x fp16 -> fp32 on gfx11). Not under graph capture | `EXL3_RDNA3_HGEMM_WIDEN` | 300-token prefill 644 -> 343 ms; 2000 tokens unchanged |
 | 5 | Fewer launches per decode step: `silu(gate) * up`, the attention output gate and the Gated DeltaNet gated RMSNorm folded into the next matmul's input transform; the RMSNorm in front of a projection bundle writes that bundle's input transform in its tail; the gate/up matmul's epilogue writes the down projection's | `EXL3_FUSE_ACT`, `EXL3_FUSE_GNORM`, `EXL3_FUSE_NORM_HAD`, `EXL3_ACT_EPI` | kernels per generation 66.8k -> 51.1k; round 36.1 -> 35.5 ms (8k: 36.85 -> 36.3) |
+| 7 | A block's final residual add (`x += mlp(x)`) is handed to the next block's input RMSNorm, which adds it in the same kernel; byte-identical output | `EXL3_RESID_DEFER` | round 34.75 -> 34.6 ms (8k: 35.55 -> 35.4) |
 | 6 | Gated DeltaNet b/a projection: all token rows from one pass over the weights, 16-byte loads, `v_dot2_f32_f16` (upstream's kernel re-reads the 1 MB weight per token with 4-byte loads: 23 us -> 4.5 us per call). New in this branch | `EXL3_RDNA_BA_GEMV` | round 35.5 -> 34.8 ms (8k: 36.3 -> 35.6) |
 
 All of them are runtime-gated to gfx11 devices; anything else keeps upstream's paths.
@@ -38,7 +39,7 @@ torch 2.13.0+rocm7.2. In-process, greedy, median ms per speculative round on the
 | | short prompts | 8k context | 32k context | VRAM (served, 196k cache) |
 |---|---|---|---|---|
 | upstream `a3bfbfd` | 39.6 | 42.6 | 47.8 | 22.3 G |
-| this branch | 34.8 | 35.6 | — | 22.6 G |
+| this branch | 34.6 | 35.4 | — | 22.6 G |
 | exllamav3-rocm `360c902` | 34.6 | 36.3 | — | 24.4 G |
 
 Served through TabbyAPI (decode t/s; prompt processing t/s):
@@ -58,9 +59,10 @@ Per generation this branch launches ~51k kernels against exllamav3-rocm's ~37k f
 (1594 vs 1638 ms busy): the remaining Gated DeltaNet decode kernels (the port runs b/a, conv and the
 recurrence as one megakernel, written for a recurrent-state layout and rollback scheme upstream no longer
 has), residual adds (the port defers them into the next norm) and per-round sampling launches. Together
-they are worth about the 0.2 ms per round still separating the two on short prompts. Next candidates,
-each under 1 %: residual-add deferral, batched verification sampling, a cheaper draft lm_head (the 6-bit
-248k-vocabulary head is ~1.1 ms of every round).
+rounds now take the same time on short prompts and less at depth. Next candidates, each under 1 %:
+batched verification sampling, a cheaper draft lm_head (the 6-bit 248k-vocabulary head is ~1.1 ms of
+every round). Known gap: in MTP draft mode a 30k-token prefill runs at ~1020 t/s against ~1170 on
+exllamav3-rocm (DFlash2 mode is unaffected); not investigated yet.
 
 ## Tried and dropped
 
@@ -70,6 +72,15 @@ each under 1 %: residual-add deferral, batched verification sampling, a cheaper 
 | The port's sliding-window skip in the decode split kernel | upstream has it |
 | The port's fused-megakernel Gated DeltaNet step | written against the old recurrent-state format and per-token history; 6 alone brings the DeltaNet decode time per round to the port's (~2.2 vs ~2.3 ms) |
 | `EXL3_GRAPHS=1` on top of upstream | no difference in speed or VRAM; the port's `EXL3_NOGRAPH=mlp,gdn,attn` saves ~0.2 GB there, so graphs are not where its extra 2 GB goes |
+
+### Quality
+
+EvalScope (ifeval, gsm8k, humaneval; 250 / 250 / 164 items, temperature 0, thinking on, `qwen-sharp`
+template), paired against exllamav3-rocm on the same items: 77.2 / 98.0 / 96.3 % vs 76.4 / 97.6 / 97.6 %;
+discordant items 7 vs 6 over 664, McNemar p = 1.0. No measurable difference.
+
+Functional checks on the served build: tool calls, image input, four concurrent requests at batch 1 and
+batch 2 (no aborted jobs; batch 2 at 21.9 GB), retrieval of a needle from ~100k tokens of context.
 
 ## Build
 
