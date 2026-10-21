@@ -18,17 +18,19 @@ Default branch `rdna`; `master` mirrors upstream.
 | 1 | Split-k small-m EXL3 matmul (`rocm/quant/exl3_rdna3*`): input transform once per matmul, one wave per 16x16 tile column, register prefetch ring on raw buffer loads, RDNA3-tuned `mul1` decode (24-bit multiplies, `v_sad_u8` byte sums, `v_dot2_f32_f16`), direct tile-word loads for 5/6-bit, residency-wave grid sizing. Dispatched ahead of the multirow GEMV for every EXL3 linear up to the reconstruct threshold | `EXL3_RDNA3_GEMM` | DFlash2 round 39.6 -> 37.8 ms (-4.5 %) |
 | 2 | Shared-input and **sliced** projection bundles (MLP gate/up, attention q/k/v/g, Gated DeltaNet qkv/z) as one input-transform launch plus one matmul launch, `blockIdx.z` per entry; sliced Q/K/V bundles re-enabled on gfx11 (`EXL3_QKV_SLICE`) | `EXL3_RDNA3_GEMM` | 37.8 -> 36.4 ms (-3.7 %) |
 | 3 | HIP flash-decoding split kernels for the graphed decode / verify path (`rocm/rdna3_attn.cu`): q_len 1 with `v_dot2` scores and online softmax; q_len 2-8 on an 8-bit cache with `v_wmma_f32_16x16x16_f16` for QK^T and PV. Same arguments and partial layout as the Triton split kernel (adapted to upstream's dense row packing), so the Triton combine kernel reduces it | `EXL3_RDNA3_ATTN`, `EXL3_RDNA3_ATTN_SPLIT_MULT` (16) | round at 8k context 39.3 -> 36.9 ms (-6 %), at 32k 47.8 -> 40.1 ms (-16 %) |
-| 4 | fp32-output GEMMs that the WMMA GEMM's gfx1100 table declines run as an fp16 product plus a widening copy (rocBLAS has no matrix-core solution for fp16 x fp16 -> fp32 on gfx11). Not under graph capture | `EXL3_RDNA3_HGEMM_WIDEN` | 300-token prefill 644 -> 343 ms; 2000 tokens unchanged |
+| 4 | gfx1100 WMMA GEMM table tuned down to m = 16 (740 entries, the gfx1151 grid plus K 5120 / 16384): fp32-output GEMMs below 512 rows run on the WMMA GEMM instead of rocBLAS's non-matrix-core kernels (fp16 x fp16 -> fp32 has no matrix-core solution there), 1.1-5x per call. Replaces this branch's earlier fp16-widen fallback, which rounded those outputs to fp16. Proposed upstream as turboderp-org/exllamav3#542 | `EXL3_ROCM_WMMA_GEMM` (upstream's) | 300-token prefill 644 -> 325 ms (widen: 343) |
 | 5 | Fewer launches per decode step: `silu(gate) * up`, the attention output gate and the Gated DeltaNet gated RMSNorm folded into the next matmul's input transform; the RMSNorm in front of a projection bundle writes that bundle's input transform in its tail; the gate/up matmul's epilogue writes the down projection's | `EXL3_FUSE_ACT`, `EXL3_FUSE_GNORM`, `EXL3_FUSE_NORM_HAD`, `EXL3_ACT_EPI` | kernels per generation 66.8k -> 51.1k; round 36.1 -> 35.5 ms (8k: 36.85 -> 36.3) |
 | 7 | A block's final residual add (`x += mlp(x)`) is handed to the next block's input RMSNorm, which adds it in the same kernel; byte-identical output | `EXL3_RESID_DEFER` | round 34.75 -> 34.6 ms (8k: 35.55 -> 35.4) |
-| 6 | Gated DeltaNet b/a projection: all token rows from one pass over the weights, 16-byte loads, `v_dot2_f32_f16` (upstream's kernel re-reads the 1 MB weight per token with 4-byte loads: 23 us -> 4.5 us per call). New in this branch | `EXL3_RDNA_BA_GEMV` | round 35.5 -> 34.8 ms (8k: 36.3 -> 35.6) |
+| 6 | Gated DeltaNet b/a projection: all token rows from one pass over the weights, 16-byte loads, `v_dot2_f32_f16` (upstream's kernel re-reads the 1 MB weight per token with 4-byte loads: 23 us -> 4.5 us per call). New in this branch; proposed upstream as turboderp-org/exllamav3#541 | `EXL3_RDNA_BA_GEMV` | round 35.5 -> 34.8 ms (8k: 36.3 -> 35.6) |
+| 8 | Reconstruct threshold per architecture: on gfx1100 / gfx1101 an EXL3 linear reconstructs to fp16 and runs the (now tuned) WMMA GEMM above 80 rows with the RDNA3 matmul (above 16 rows without it) instead of upstream's 144, where that is faster | `EXL3_RECONSTRUCT_THRESHOLD` (rows) | prefill 100 tokens 250 -> 207 ms, 144 tokens 327 -> 245 ms |
+| 9 | Recurrent checkpoints are stashed into pinned host slabs with non-blocking copies: a stash used to stall the prefill on dozens of blocking copies into freshly allocated pageable memory | — | time to first token 300 tokens 422 -> 394 ms, 2000 tokens 1534 -> 1474 ms, 8000 tokens 5855 -> 5680 ms (GPU idle per 8k prefill 293 -> 76 ms) |
 
-All of them are runtime-gated to gfx11 devices; anything else keeps upstream's paths.
+1-8 are runtime-gated to gfx11 devices (4 and 8 to gfx1100 / gfx1101); anything else keeps upstream's paths. 9 applies to every backend.
 
 Numerics: 1-3 change the accumulation order of decode-path matmuls / attention. Decode logits against
 upstream's own kernels: KL 3.8e-5 (matmul) / 8.4e-5 (with bundles), top-1 agreement 100 %, and both
 builds sit at the same distance from a full-forward reference. Greedy text is unchanged on most prompts.
-4 rounds residual-stream projections to fp16 during prefill (logit KL 2.6e-4, top-1 100 %). 5 is
+4 keeps fp32 output where the earlier widen rounded to fp16: decode logits sit closer to a full-forward reference (max deviation 7.1 -> 4.1) and greedy text changes on near ties. 5 is
 byte-identical for the norm hand-off; 6 moves decode logits by KL 7.9e-6.
 
 ### Measured
@@ -39,7 +41,8 @@ torch 2.13.0+rocm7.2. In-process, greedy, median ms per speculative round on the
 | | short prompts | 8k context | 32k context | VRAM (served, 196k cache) |
 |---|---|---|---|---|
 | upstream `a3bfbfd` | 39.6 | 42.6 | 47.8 | 22.3 G |
-| this branch | 34.6 | 35.4 | — | 22.6 G |
+| this branch, 2026-10-20 (rows 1-3, 5-7, widen) | 34.6 | 35.4 | — | 22.6 G |
+| this branch, 2026-10-21 (rows 1-9) | 34.4 | 35.3 | — | 22.5 G |
 | exllamav3-rocm `360c902` | 34.6 | 36.3 | — | 24.4 G |
 
 Served through TabbyAPI (decode t/s; prompt processing t/s):
@@ -47,22 +50,28 @@ Served through TabbyAPI (decode t/s; prompt processing t/s):
 | | prose | json | refactor | reasoning | 8k: prefill / decode | 30k prefill | prose prompt |
 |---|---|---|---|---|---|---|---|
 | upstream `a3bfbfd` | 59.1 | 163.4 | 197.5 | 135.4 | 1110 / 66.1 | 1138 | 325 |
-| this branch | 75.3 | 175.6 | **225.1** | 160.2 | 1299 / **83.9** | 1232 | 596 |
+| this branch, 2026-10-20 | 75.3 | 175.6 | 225.1 | 160.2 | 1299 / **83.9** | 1232 | 596 |
+| this branch, 2026-10-21 | 73.0 | 176.2 | **227.7** | **165.3** | **1304** / 80.0 | **1234** | **622** |
 | exllamav3-rocm `360c902` | 67.5 | 184.7 | 219.9 | 158.7 | 1217 / 81.3 | 1147 | 563 |
 
-Served decode depends on the greedy text, which differs between builds; refactor and the 8k row produce
-byte-identical text on both, so those two are like for like. VRAM served: 22.6 vs 24.4 GB.
+Served decode depends on the greedy text, which differs between builds; refactor produces byte-identical
+text on all three (like for like), the 8k row on exllamav3-rocm and the 2026-10-20 build (row 4 changes it
+since: draft acceptance 28 -> 25 %, in-process 8k rounds 35.4 -> 35.3 ms on identical text). Prompt
+processing of short prompts is +4-6 % from rows 4, 8 and 9. VRAM served: 22.5 vs 24.4 GB.
+
+MTP draft mode (`--draft-mode mtp`), served 30k-token prefill: 1248 t/s against 1166 on exllamav3-rocm.
 
 ## What is still left
 
-Per generation this branch launches ~51k kernels against exllamav3-rocm's ~37k for the same GPU work
-(1594 vs 1638 ms busy): the remaining Gated DeltaNet decode kernels (the port runs b/a, conv and the
-recurrence as one megakernel, written for a recurrent-state layout and rollback scheme upstream no longer
-has), residual adds (the port defers them into the next norm) and per-round sampling launches. Together
-rounds now take the same time on short prompts and less at depth. Next candidates, each under 1 %:
-batched verification sampling, a cheaper draft lm_head (the 6-bit 248k-vocabulary head is ~1.1 ms of
-every round). Known gap: in MTP draft mode a 30k-token prefill runs at ~1020 t/s against ~1170 on
-exllamav3-rocm (DFlash2 mode is unaffected); not investigated yet.
+During DFlash2 decode the GPU is busy ~82 % of the wall time; most of the rest are the ~5 us dispatch gaps
+between ~940 kernels per round, the remainder per-round host turnaround. Per generation this branch launches
+~51k kernels against exllamav3-rocm's ~37k for the same GPU work: the remaining Gated DeltaNet decode
+kernels (the port runs b/a, conv and the recurrence as one megakernel, written for a recurrent-state layout
+and rollback scheme upstream no longer has) and per-round sampling launches. ~22 ms of a ~34.4 ms round
+are the 8-row verification matmuls, which are VALU- and memory-bound at once (exllamav3-rocm's README
+measures this in detail). Next candidates, each around 1 %: a parallel RMSNorm transform tail, RoPE + paged
+KV update + q/g deinterleave as one kernel, a cheaper draft lm_head (the 6-bit 248k-vocabulary head is ~1.1
+ms of every round, but changes acceptance).
 
 ## Tried and dropped
 
@@ -71,6 +80,8 @@ exllamav3-rocm (DFlash2 mode is unaffected); not investigated yet.
 | The port's Gated DeltaNet register-resident recurrence | upstream now carries the state slice in registers itself (`0f685aa9`) and re-advances from one initial state instead of writing per-token history (`3a8e2fb8`), which was the port's own bottleneck |
 | The port's sliding-window skip in the decode split kernel | upstream has it |
 | The port's fused-megakernel Gated DeltaNet step | written against the old recurrent-state format and per-token history; 6 alone brings the DeltaNet decode time per round to the port's (~2.2 vs ~2.3 ms) |
+| fp16-widen for fp32-output GEMMs the gfx1100 table declined (this branch until 2026-10-21) | superseded by the tuned table (row 4), which is faster and keeps fp32 output |
+| WMMA GEMM for fp16-output GEMMs too (route bit 2) | hipBLAS has matrix-core kernels for fp16 output; with the fp32-tuned configs prefill got slower (300 tokens 324 -> 339 ms) |
 | `EXL3_GRAPHS=1` on top of upstream | no difference in speed or VRAM; the port's `EXL3_NOGRAPH=mlp,gdn,attn` saves ~0.2 GB there, so graphs are not where its extra 2 GB goes |
 
 ### Quality
@@ -90,7 +101,7 @@ ROCm 7.2.x and a ROCm build of PyTorch, then `PYTORCH_ROCM_ARCH=gfx1100 python s
 ## Credits
 
 - exllamav3 by turboderp and contributors, MIT.
-- The RDNA3 kernels in 1-4 come from [phoenixhaxor/exllamav3-rocm](https://github.com/phoenixhaxor/exllamav3-rocm)
+- The RDNA3 kernels in 1-3 and 5 come from [phoenixhaxor/exllamav3-rocm](https://github.com/phoenixhaxor/exllamav3-rocm)
   (MIT); their design notes and measurements are in that repository's README.
 
 ---
