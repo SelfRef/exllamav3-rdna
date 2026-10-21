@@ -20,8 +20,8 @@ Default branch `rdna`; `master` mirrors upstream.
 | 3 | HIP flash-decoding split kernels for the graphed decode / verify path (`rocm/rdna3_attn.cu`): q_len 1 with `v_dot2` scores and online softmax; q_len 2-8 on an 8-bit cache with `v_wmma_f32_16x16x16_f16` for QK^T and PV. Same arguments and partial layout as the Triton split kernel (adapted to upstream's dense row packing), so the Triton combine kernel reduces it | `EXL3_RDNA3_ATTN`, `EXL3_RDNA3_ATTN_SPLIT_MULT` (16) | round at 8k context 39.3 -> 36.9 ms (-6 %), at 32k 47.8 -> 40.1 ms (-16 %) |
 | 4 | gfx1100 WMMA GEMM table tuned down to m = 16 (740 entries, the gfx1151 grid plus K 5120 / 16384): fp32-output GEMMs below 512 rows run on the WMMA GEMM instead of rocBLAS's non-matrix-core kernels (fp16 x fp16 -> fp32 has no matrix-core solution there), 1.1-5x per call. Replaces this branch's earlier fp16-widen fallback, which rounded those outputs to fp16. Proposed upstream as turboderp-org/exllamav3#542 | `EXL3_ROCM_WMMA_GEMM` (upstream's) | 300-token prefill 644 -> 325 ms (widen: 343) |
 | 5 | Fewer launches per decode step: `silu(gate) * up`, the attention output gate and the Gated DeltaNet gated RMSNorm folded into the next matmul's input transform; the RMSNorm in front of a projection bundle writes that bundle's input transform in its tail; the gate/up matmul's epilogue writes the down projection's | `EXL3_FUSE_ACT`, `EXL3_FUSE_GNORM`, `EXL3_FUSE_NORM_HAD`, `EXL3_ACT_EPI` | kernels per generation 66.8k -> 51.1k; round 36.1 -> 35.5 ms (8k: 36.85 -> 36.3) |
-| 7 | A block's final residual add (`x += mlp(x)`) is handed to the next block's input RMSNorm, which adds it in the same kernel; byte-identical output | `EXL3_RESID_DEFER` | round 34.75 -> 34.6 ms (8k: 35.55 -> 35.4) |
 | 6 | Gated DeltaNet b/a projection: all token rows from one pass over the weights, 16-byte loads, `v_dot2_f32_f16` (upstream's kernel re-reads the 1 MB weight per token with 4-byte loads: 23 us -> 4.5 us per call). New in this branch; proposed upstream as turboderp-org/exllamav3#541 | `EXL3_RDNA_BA_GEMV` | round 35.5 -> 34.8 ms (8k: 36.3 -> 35.6) |
+| 7 | A block's final residual add (`x += mlp(x)`) is handed to the next block's input RMSNorm, which adds it in the same kernel; byte-identical output | `EXL3_RESID_DEFER` | round 34.75 -> 34.6 ms (8k: 35.55 -> 35.4) |
 | 8 | Reconstruct threshold per architecture: on gfx1100 / gfx1101 an EXL3 linear reconstructs to fp16 and runs the (now tuned) WMMA GEMM above 80 rows with the RDNA3 matmul (above 16 rows without it) instead of upstream's 144, where that is faster | `EXL3_RECONSTRUCT_THRESHOLD` (rows) | prefill 100 tokens 250 -> 207 ms, 144 tokens 327 -> 245 ms |
 | 9 | Recurrent checkpoints are stashed into pinned host slabs with non-blocking copies: a stash used to stall the prefill on dozens of blocking copies into freshly allocated pageable memory | — | time to first token 300 tokens 422 -> 394 ms, 2000 tokens 1534 -> 1474 ms, 8000 tokens 5855 -> 5680 ms (GPU idle per 8k prefill 293 -> 76 ms) |
 
@@ -88,10 +88,12 @@ ms of every round, but changes acceptance).
 
 EvalScope (ifeval, gsm8k, humaneval; 250 / 250 / 164 items, temperature 0, thinking on, `qwen-sharp`
 template), paired against exllamav3-rocm on the same items: 77.2 / 98.0 / 96.3 % vs 76.4 / 97.6 / 97.6 %;
-discordant items 7 vs 6 over 664, McNemar p = 1.0. No measurable difference.
+discordant items 7 vs 6 over 664, McNemar p = 1.0. No measurable difference. The 2026-10-21 build (rows 4,
+8, 9) against the 2026-10-20 one on the same items: 76.8 / 97.6 / 97.0 % vs 77.2 / 98.0 / 96.3 %, discordant
+8 vs 9, p = 1.0.
 
 Functional checks on the served build: tool calls, image input, four concurrent requests at batch 1 and
-batch 2 (no aborted jobs; batch 2 at 21.9 GB), retrieval of a needle from ~100k tokens of context.
+batch 2 (no aborted jobs; batch 2 at 21.9 GB), retrieval of a needle from ~100k tokens of context (2026-10-21 build: all but batch 2 re-run, pass).
 
 ## Build
 
