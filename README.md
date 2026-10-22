@@ -9,7 +9,7 @@ RDNA3 with hand-written kernels; that port has not moved since 2026-09-26 and ca
 independent ROCm backends over the same files). Measured on the same card, upstream decoded 10-19 %
 slower than that port while using 2 GB less VRAM. Branch `rdna` is upstream plus the port's kernels that
 still pay off on top of current upstream, each behind a switch and each kept only on a measurement.
-Default branch `rdna`; `master` mirrors upstream.
+Default branch `rdna` follows upstream `dev` (where outside PRs land; merged in, never rebased); `master` and `dev` mirror upstream.
 
 ## What branch `rdna` carries
 
