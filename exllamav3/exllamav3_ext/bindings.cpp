@@ -36,6 +36,7 @@
 #include "quant/exl3_moe_coop.cuh"
 
 #include "generator/strings.h"
+#include "generator/staging.h"
 #include "generator/sampling_basic.cuh"
 #include "generator/sampling_extra.cuh"
 #include "generator/gumbel.cuh"
@@ -228,6 +229,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
+    m.def("fa75_fwd_slice", &fa75_fwd_slice, "fa75_fwd_slice");
 #endif
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
@@ -299,6 +301,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");
 
     m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
+    m.def("generator_stage_decode", &generator_stage_decode, "generator_stage_decode");
     m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
 
     m.def("quant_cache_cont", &quant_cache_cont, "quant_cache_cont");

@@ -14,11 +14,6 @@ import os
 _norm_had_enable = RDNA3_MATMUL and os.environ.get("EXL3_FUSE_NORM_HAD", "1") != "0"
 
 
-# RDNA3: a block's final residual add (x += mlp(x)) is handed to the next block's input RMSNorm, which adds it
-# in the same kernel (rms_norm_res_in); one elementwise launch less per layer. EXL3_RESID_DEFER=0 disables
-resid_defer_enable = RDNA3_MATMUL and os.environ.get("EXL3_RESID_DEFER", "1") != "0"
-
-
 def _had_for(module, x):
     """Input bundle of the module's first fused matmul (RMSNorm had_for); None where not applicable"""
     if not _norm_had_enable:
@@ -173,8 +168,8 @@ class TransformerBlock(Module):
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
 
-        # Previous block's MLP output whose residual add is folded into this block's input norm (forward_ls
-        # sets resid_defer when the next module is a TransformerBlock on the same device)
+        # Previous block's MLP output whose residual add is folded into this block's input norm (forward_ls sets
+        # resid_defer when the next module is a TransformerBlock on the same device)
         pending = params.pop("resid_pending", None)
         fuse_in = (
             pending is not None and self.attn is not None and not self.attn_hc and
