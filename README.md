@@ -43,6 +43,7 @@ torch 2.13.0+rocm7.2. In-process, greedy, median ms per speculative round on the
 | upstream `a3bfbfd` | 39.6 | 42.6 | 47.8 | 22.3 G |
 | this branch, 2026-10-20 (rows 1-3, 5-7, widen) | 34.6 | 35.4 | — | 22.6 G |
 | this branch, 2026-10-21 (rows 1-9) | 34.4 | 35.3 | — | 22.5 G |
+| this branch, 2026-10-25 (upstream `dev` `33435f22`) | 34.3-34.9 | 35.8 | — | 21.8 G |
 | exllamav3-rocm `360c902` | 34.6 | 36.3 | — | 24.4 G |
 
 Served through TabbyAPI (decode t/s; prompt processing t/s):
@@ -82,6 +83,7 @@ ms of every round, but changes acceptance).
 | The port's fused-megakernel Gated DeltaNet step | written against the old recurrent-state format and per-token history; 6 alone brings the DeltaNet decode time per round to the port's (~2.2 vs ~2.3 ms) |
 | fp16-widen for fp32-output GEMMs the gfx1100 table declined (this branch until 2026-10-21) | superseded by the tuned table (row 4), which is faster and keeps fp32 output |
 | WMMA GEMM for fp16-output GEMMs too (route bit 2) | hipBLAS has matrix-core kernels for fp16 output; with the fp32-tuned configs prefill got slower (300 tokens 324 -> 339 ms) |
+| Upstream's dynamic sparse drafting head (`sparse_draft_head`, 8k / 16k / 32k columns) | in process on fixed prompts it looked like +12-23 % decode (rounds -3 %, more tokens per round), but those prompts repeat between runs and the token profile persists, so the subset had learned the answers. Served through TabbyAPI with fresh prompts, alternating on/off: prose -5 %, json and 8k-context decode within noise, +0.1-0.3 GB. A cold profile (first session) drafts much worse (expl prompt 113 -> 60 tok/s) |
 | `EXL3_GRAPHS=1` on top of upstream | no difference in speed or VRAM; the port's `EXL3_NOGRAPH=mlp,gdn,attn` saves ~0.2 GB there, so graphs are not where its extra 2 GB goes |
 
 ### Quality
