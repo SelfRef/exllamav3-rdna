@@ -44,6 +44,7 @@ torch 2.13.0+rocm7.2. In-process, greedy, median ms per speculative round on the
 | this branch, 2026-10-20 (rows 1-3, 5-7, widen) | 34.6 | 35.4 | — | 22.6 G |
 | this branch, 2026-10-21 (rows 1-9) | 34.4 | 35.3 | — | 22.5 G |
 | this branch, 2026-10-25 (upstream `dev` `33435f22`) | 34.3-34.9 | 35.8 | — | 21.8 G |
+| this branch, 2026-10-31 (upstream `dev` `bd1f5191`, v1.6.6) | 34.2-34.5 | 35.7 | — | 21.8 G |
 | exllamav3-rocm `360c902` | 34.6 | 36.3 | — | 24.4 G |
 
 Served through TabbyAPI (decode t/s; prompt processing t/s):
@@ -59,6 +60,12 @@ Served decode depends on the greedy text, which differs between builds; refactor
 text on all three (like for like), the 8k row on exllamav3-rocm and the 2026-10-20 build (row 4 changes it
 since: draft acceptance 28 -> 25 %, in-process 8k rounds 35.4 -> 35.3 ms on identical text). Prompt
 processing of short prompts is +4-6 % from rows 4, 8 and 9. VRAM served: 22.5 vs 24.4 GB.
+
+On 2026-10-31 the base moved to upstream v1.6.6 (`dev` `bd1f5191`: the new loop detector, batched sampler
+results while drafting, draft-model budgeting at load, the reconstruct fix after in-place Hadamards). Greedy
+output is byte-identical to the previous base on every in-process prompt and on the served refactor and 30k
+prefill texts; served refactor 228.2 t/s, 8k 1000 / 82.6, 30k prefill 1059 t/s; the gfx1100 reconstruct
+threshold of 80 rows is still the crossover.
 
 MTP draft mode (`--draft-mode mtp`), served 30k-token prefill: 1248 t/s against 1166 on exllamav3-rocm.
 
