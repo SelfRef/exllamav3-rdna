@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 from ..util.tensor import to2
+from ..util.device_copy import to_device
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
 from .hyperconnections import HyperConnection, hc_flush
@@ -181,9 +182,12 @@ class TransformerBlock(Module):
         if self.attn:
             if self.attn_hc:
                 hc_post, hc_comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm)
-                y = y.half()
                 if self.attn_norm and not normed:
+                    # Normalize from the collapse's own precision (fp32 on the carry path, see
+                    # HyperConnection.mix_norm) rather than a half copy of it
                     y = self.attn_norm.forward(y, params, out_dtype = torch.half)
+                else:
+                    y = y.half()
             elif fuse_in:
                 hf = _had_for(self.attn, x)
                 y = self.attn_norm.forward(pending, params, out_dtype = torch.half, residual_in = x,
@@ -193,7 +197,13 @@ class TransformerBlock(Module):
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half, **({"had_for": hf} if hf else {}))
             else:
                 y = x.half()
-            y = self.attn.forward(y, params)
+            if self.attn.device != self.device:
+                # Attention pinned to the split's attention device (Model.load attn_device): its fp16
+                # input and output are what crosses, the residual streams stay here
+                y = self.attn.forward(self.attn.prepare_for_device(y, params), params)
+                y = to_device(y, self.device)
+            else:
+                y = self.attn.forward(y, params)
             if params.get("prefill") and not export_state:
                 return x
             if self.attn_resid_scalar is not None:
@@ -210,9 +220,12 @@ class TransformerBlock(Module):
         if self.mlp:
             if self.mlp_hc:
                 hc_post, hc_comb, y, normed = self.mlp_hc.mix_norm(x, params, self.mlp_norm)
-                y = y.half()
                 if self.mlp_norm and not normed:
+                    # Normalize from the collapse's own precision (fp32 on the carry path, see
+                    # HyperConnection.mix_norm) rather than a half copy of it
                     y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
+                else:
+                    y = y.half()
             else:
                 params["residual"] = x
                 if y_resid is not None:
