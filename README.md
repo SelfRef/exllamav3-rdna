@@ -61,6 +61,20 @@ text on all three (like for like), the 8k row on exllamav3-rocm and the 2026-10-
 since: draft acceptance 28 -> 25 %, in-process 8k rounds 35.4 -> 35.3 ms on identical text). Prompt
 processing of short prompts is +4-6 % from rows 4, 8 and 9. VRAM served: 22.5 vs 24.4 GB.
 
+Quant size, this branch at v1.6.6 (2026-11-02), same flags (196k Q8 cache, Q4 draft cache), fresh server per
+run, order A B B A, mean of two runs of `--repeat 3`. 4.00 bpw is r0b0tlab's
+[EXL3 4.00bpw](https://huggingface.co/r0b0tlab/Qwen3.8-27B-EXL3-4.00bpw) (`3f1771b8`) with its
+[DFlash2 4.00bpw](https://huggingface.co/r0b0tlab/Qwen3.8-27B-DFlash2-EXL3-4.00bpw) draft (`265b5240`):
+
+| | prose | json | refactor | reasoning | 8k: prefill / decode | 30k prefill | prose prompt | VRAM loaded / peak |
+|---|---|---|---|---|---|---|---|---|
+| 3.5 bpw + DFlash2 5.0 bpw | 71.7 | 182.6 | **225.8** | **153.1** | 1208 / 72.5 | **1117** | 618 | **21.2 / 21.8 GiB** |
+| 4.00 bpw + DFlash2 4.00 bpw | **72.6** | **191.5** | 222.3 | 151.7 | **1248 / 87.4** | 1115 | **631** | 22.2 / 22.9 GiB |
+
+Refactor is again the only like-for-like preset (identical text on all four runs). The other decode cells
+follow the greedy text, which also differed between two fresh servers of the same quant (3.5 bpw prose
+73.6 / 69.7, reasoning 162.9 / 143.2); the 8k gain comes with higher draft acceptance (30 vs 21-24 %).
+
 On 2026-10-31 the base moved to upstream v1.6.6 (`dev` `bd1f5191`: the new loop detector, batched sampler
 results while drafting, draft-model budgeting at load, the reconstruct fix after in-place Hadamards). Greedy
 output is byte-identical to the previous base on every in-process prompt and on the served refactor and 30k
