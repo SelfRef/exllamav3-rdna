@@ -20,7 +20,13 @@
 // - the four waves merge through LDS, then one partial per (row, split) is stored
 //
 // Scope: causal, no window / softcap / sinks, q_len <= 16, head_dim 128 or 256, cache fp16 or
-// 8-bit for both K and V, softmax scale 1/sqrt(head_dim). Other configurations keep Triton.
+// quantized (KB-bit K, VB-bit V, 2..8 each, see rdna3_attn_split_kernel for the instantiated pairs),
+// softmax scale 1/sqrt(head_dim). Other configurations keep Triton.
+//
+// Quantized cache layout (cache/q_cache_kernels.cuh, read by triton_paged._qc_load_kt): a group of 32
+// values owns B uint32 words holding the power-of-two bit planes B is made of (8, 4, 2, 1; widest and most
+// significant first), plane W storing value j in word j * W / 32 at bit (j * W) % 32. A value is
+// (raw - (2^(B-1) - 0.5)) * scale / 2^(B-1) in the Hadamard-rotated domain. B = 8 is one byte per value.
 //
 // Adapted from exllamav3-rocm (github.com/phoenixhaxor/exllamav3-rocm, MIT).
 
@@ -38,14 +44,94 @@ __device__ __forceinline__ float dot2(uint32_t a, uint32_t b, float c)
     return __builtin_amdgcn_fdot2(__builtin_bit_cast(hv2, a), __builtin_bit_cast(hv2, b), c, false);
 }
 
-// Two unsigned bytes of w (selected by v_perm; bytes 4-7 of the pair are 0x64) as a half2 of (b - 128):
+// Two unsigned bytes of w (selected by v_perm; bytes 4-7 of the pair are 0x64) as a half2 of (b - MID):
 // 0x64bb is 1024 + b
+template <int MID>
 __device__ __forceinline__ uint32_t bytes_to_h2c(uint32_t w, uint32_t sel)
 {
     uint32_t h = __builtin_amdgcn_perm(0x64646464u, w, sel);
     half2 v = *reinterpret_cast<half2*>(&h);
-    v = __hsub2(v, __float2half2_rn(1152.0f));
+    v = __hsub2(v, __float2half2_rn((float) (1024 + MID)));
     return *reinterpret_cast<uint32_t*>(&v);
+}
+
+// The B words of one 32-value group, from a pointer that need not be 16-byte aligned (B * 4 bytes per group)
+template <int B>
+__device__ __forceinline__ void qc_load_words(const uint32_t* p, uint32_t* w)
+{
+    if constexpr (B % 4 == 0)
+    {
+        #pragma unroll
+        for (int i = 0; i < B / 4; ++i) { const uint4 v = ((const uint4*) p)[i]; w[4 * i] = v.x; w[4 * i + 1] = v.y; w[4 * i + 2] = v.z; w[4 * i + 3] = v.w; }
+    }
+    else if constexpr (B % 2 == 0)
+    {
+        #pragma unroll
+        for (int i = 0; i < B / 2; ++i) { const uint2 v = ((const uint2*) p)[i]; w[2 * i] = v.x; w[2 * i + 1] = v.y; }
+    }
+    else
+    {
+        #pragma unroll
+        for (int i = 0; i < B; ++i) w[i] = p[i];
+    }
+}
+
+// The 32 raw values (0 .. 2^B - 1) of a group as 8 words of 4 bytes, value 4i + k in byte k of word i
+template <int B>
+__device__ __forceinline__ void qc_unpack32(const uint32_t* w, uint32_t* out)
+{
+    #pragma unroll
+    for (int o = 0; o < 8; ++o)
+    {
+        uint32_t word = 0;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k)
+        {
+            const int j = o * 4 + k;
+            uint32_t raw = 0;
+            int wb = 0;
+            #pragma unroll
+            for (int W = 8; W >= 1; W >>= 1)
+                if (B & W)
+                {
+                    raw = (raw << W) | ((w[wb + (j * W) / 32] >> ((j * W) % 32)) & ((1u << W) - 1u));
+                    wb += W;
+                }
+            word |= raw << (8 * k);
+        }
+        out[o] = word;
+    }
+}
+
+// The DPL consecutive raw values o0 .. o0 + DPL - 1 of a group (o0 a multiple of DPL), V's lane <-> dims layout:
+// accumulates one plane at a time, widest first
+template <int B, int DPL, int W>
+__device__ __forceinline__ void qc_v_plane(const uint32_t* vw, int o0, int& wb, uint32_t* raw)
+{
+    if constexpr (B & W)
+    {
+        constexpr int NW = (DPL * W + 31) / 32;
+        const int wi = wb + (o0 * W) / 32;
+        uint64_t ww = vw[wi];
+        if constexpr (NW > 1) ww |= (uint64_t) vw[wi + 1] << 32;
+        const int sh = (o0 * W) % 32;
+        #pragma unroll
+        for (int k = 0; k < DPL; ++k)
+            raw[k] = (raw[k] << W) | (uint32_t) ((ww >> (sh + k * W)) & ((1u << W) - 1u));
+        wb += W;
+    }
+}
+
+template <int B, int DPL>
+__device__ __forceinline__ void qc_v_raw(const uint32_t* vw, int o0, uint32_t* raw)
+{
+    #pragma unroll
+    for (int k = 0; k < DPL; ++k) raw[k] = 0;
+    int wb = 0;
+    qc_v_plane<B, DPL, 8>(vw, o0, wb, raw);
+    qc_v_plane<B, DPL, 4>(vw, o0, wb, raw);
+    qc_v_plane<B, DPL, 2>(vw, o0, wb, raw);
+    qc_v_plane<B, DPL, 1>(vw, o0, wb, raw);
 }
 
 __device__ __forceinline__ float wave_max(float v)
@@ -75,7 +161,7 @@ template <int QL> struct AttnGeom
     static constexpr int WAVES = TG * RG;
 };
 
-template <int QC, int HD, int QL, int GROUP>
+template <int KB, int VB, int HD, int QL, int GROUP>
 __global__ __launch_bounds__(AttnGeom<QL>::WAVES * 32)
 void rdna3_attn_decode_split_kernel
 (
@@ -110,8 +196,10 @@ void rdna3_attn_decode_split_kernel
     constexpr int G = HD / 32;                               // 32-value groups per head
     constexpr int DPL = HD / 32;                             // value dims per lane
     constexpr int H_BLOCKS = (QL * GROUP + BLOCK_ROWS - 1) / BLOCK_ROWS;
+    constexpr int KMID = KB > 0 ? 1 << (KB - 1) : 1;         // the quantized grid's half range: raw - KMID + 0.5 is a unit-step value
+    constexpr int VMID = VB > 0 ? 1 << (VB - 1) : 1;
 
-    __shared__ uint32_t qs[NROWS][HD / 2];       // q rows as half2 (rotated for 8-bit keys)
+    __shared__ uint32_t qs[NROWS][HD / 2];       // q rows as half2 (rotated for quantized keys)
     __shared__ float qsum[NROWS][G];             // per-group sums of qs (midpoint correction)
     __shared__ float pbuf[WAVES][TB][RW];        // softmax weights of the current block
     __shared__ float accm[TG > 1 ? RW : 1][TG > 1 ? HD : 1];    // cross-wave merge (decode)
@@ -143,7 +231,7 @@ void rdna3_attn_decode_split_kernel
         const half* qp = q + ((size_t) (batch * QL + qi) * NQH + kvh * GROUP + hl) * HD + g * 32;
         #pragma unroll
         for (int i = 0; i < 32; ++i) x[i] = __half2float(qp[i]);
-        if constexpr (QC > 0)
+        if constexpr (KB > 0)
         {
             #pragma unroll
             for (int h = 1; h < 32; h <<= 1)
@@ -167,7 +255,7 @@ void rdna3_attn_decode_split_kernel
         for (int i = threadIdx.x; i < RW * HD; i += NTH) (&accm[0][0])[i] = 0.0f;
     __syncthreads();
 
-    const float sm_scale = QC > 0 ? rsqrtf((float) HD) / 128.0f : rsqrtf((float) HD);
+    const float sm_scale = rsqrtf((float) HD) / (float) (KB > 0 ? KMID : 1);
 
     const int rg = warp / TG;                      // row group = query position
     const int tg = warp % TG;                      // token group
@@ -194,6 +282,7 @@ void rdna3_attn_decode_split_kernel
         const int tc = tvalid ? t : t_last - 1;
         const int tok_row = bt[tc / PAGE] * PAGE + (tc % PAGE);
         const size_t kbase = (size_t) tok_row * row_elems + (size_t) kvh * HD;
+        [[maybe_unused]] const size_t kword = (size_t) tok_row * (NKV * G * (KB > 0 ? KB : 1)) + (size_t) kvh * (G * (KB > 0 ? KB : 1));
 
         // Scores for this lane's token
         float s[RW];
@@ -205,16 +294,16 @@ void rdna3_attn_decode_split_kernel
         {
             uint32_t kw[16];
             float gs = 1.0f;
-            if constexpr (QC > 0)
+            if constexpr (KB > 0)
             {
-                const uint4* kp = (const uint4*) ((const uint8_t*) k_cache + kbase + g * 32);
-                uint4 a = kp[0], b = kp[1];
-                uint32_t w8[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+                uint32_t pk[KB > 0 ? KB : 1], w8[8];
+                rdna3_attn::qc_load_words<KB>((const uint32_t*) k_cache + kword + g * KB, pk);
+                rdna3_attn::qc_unpack32<KB>(pk, w8);
                 #pragma unroll
                 for (int i = 0; i < 8; ++i)
                 {
-                    kw[2 * i] = rdna3_attn::bytes_to_h2c(w8[i], 0x04010400u);
-                    kw[2 * i + 1] = rdna3_attn::bytes_to_h2c(w8[i], 0x04030402u);
+                    kw[2 * i] = rdna3_attn::bytes_to_h2c<KMID>(w8[i], 0x04010400u);
+                    kw[2 * i + 1] = rdna3_attn::bytes_to_h2c<KMID>(w8[i], 0x04030402u);
                 }
                 gs = __half2float(k_scales[(size_t) tok_row * (NKV * G) + kvh * G + g]);
             }
@@ -242,7 +331,7 @@ void rdna3_attn_decode_split_kernel
                     d = rdna3_attn::dot2(kw[4 * i + 2], qv.z, d);
                     d = rdna3_attn::dot2(kw[4 * i + 3], qv.w, d);
                 }
-                if constexpr (QC > 0) d = (d + 0.5f * qsum[row0 + r][g]) * gs;   // (b - 128) + 0.5 = b - 127.5
+                if constexpr (KB > 0) d = (d + 0.5f * qsum[row0 + r][g]) * gs;   // (raw - KMID) + 0.5
                 s[r] += d;
             }
         }
@@ -274,19 +363,14 @@ void rdna3_attn_decode_split_kernel
             const size_t vbase = (size_t) vrow * row_elems + (size_t) kvh * HD + lane * DPL;
             float vf[DPL];
             float vs = 1.0f;
-            if constexpr (QC > 0)
+            if constexpr (VB > 0)
             {
-                const uint8_t* vp = (const uint8_t*) v_cache + vbase;
+                const uint32_t* vw = (const uint32_t*) v_cache + (size_t) vrow * (NKV * G * VB) + (size_t) kvh * (G * VB) + (size_t) ((lane * DPL) / 32) * VB;
+                uint32_t vr[DPL];
+                rdna3_attn::qc_v_raw<VB, DPL>(vw, (lane * DPL) % 32, vr);
                 #pragma unroll
-                for (int j = 0; j < DPL; j += 4)
-                {
-                    uint32_t w = *(const uint32_t*) (vp + j);
-                    vf[j] = (float) ((w >> 0) & 0xffu);
-                    vf[j + 1] = (float) ((w >> 8) & 0xffu);
-                    vf[j + 2] = (float) ((w >> 16) & 0xffu);
-                    vf[j + 3] = (float) ((w >> 24) & 0xffu);
-                }
-                vs = __half2float(v_scales[(size_t) vrow * (NKV * G) + kvh * G + (lane * DPL) / 32]) * (1.0f / 128.0f);
+                for (int j = 0; j < DPL; ++j) vf[j] = (float) vr[j];
+                vs = __half2float(v_scales[(size_t) vrow * (NKV * G) + kvh * G + (lane * DPL) / 32]) * (1.0f / (float) VMID);
             }
             else
             {
@@ -317,10 +401,10 @@ void rdna3_attn_decode_split_kernel
     for (int r = 0; r < RW; ++r)
     {
         l[r] = rdna3_attn::wave_sum(l[r]);
-        if constexpr (QC > 0)
+        if constexpr (VB > 0)
         {
             #pragma unroll
-            for (int j = 0; j < DPL; ++j) acc[r][j] -= 127.5f * psum[r];
+            for (int j = 0; j < DPL; ++j) acc[r][j] -= ((float) VMID - 0.5f) * psum[r];
         }
     }
 
@@ -394,14 +478,15 @@ void rdna3_attn_decode_split_kernel
     }
 }
 
-// Verification (2 <= q_len <= 8), 8-bit cache, matrix cores: S = Q K^T and O += P V as
+// Verification (2 <= q_len <= 8), quantized cache, matrix cores: S = Q K^T and O += P V as
 // v_wmma_f32_16x16x16_f16 tiles. Rows (q_len x GROUP, query-major) pad to 16-row tiles; K/V tiles
-// of TB tokens are staged in LDS (V transposed by 4-dim words so a WMMA B fragment is 4 contiguous
-// reads), with a register prefetch of the next tile
+// of TB tokens are staged in LDS as one byte per value (unpacked from the KB / VB bit planes as they are
+// committed; V transposed by 4-dim words so a WMMA B fragment is 4 contiguous reads), with a register
+// prefetch of the next tile
 typedef _Float16 v16h __attribute__((ext_vector_type(16)));
 typedef float v8f __attribute__((ext_vector_type(8)));
 
-template <int HD, int QL, int GROUP>
+template <int KB, int VB, int HD, int QL, int GROUP>
 __global__ __launch_bounds__(256)
 void rdna3_attn_verify_wmma_kernel
 (
@@ -446,10 +531,9 @@ void rdna3_attn_verify_wmma_kernel
     constexpr int KSTR = HD + 16;                   // key row stride (bytes)
     constexpr int VSTR = TB + 4;                    // transposed value row stride (words)
     constexpr int PSTR = TB + 8;                    // p row stride (halves)
-    constexpr int CPR = HD / 16;
-    constexpr int NCHUNK = 2 * TB * CPR;
-    constexpr int NSC = 2 * TB * G;
-    constexpr int PER_T = (NCHUNK + NTH - 1) / NTH;
+    constexpr int KMID = 1 << (KB - 1);
+    constexpr int VMID = 1 << (VB - 1);
+    constexpr int NSC = 2 * TB * G;                 // (K or V, token, 32-value group) tasks: scales and packed words
     constexpr int PER_S = (NSC + NTH - 1) / NTH;
     static_assert(RT * 2 <= W && DT % W == 0, "tile decomposition");
 
@@ -516,30 +600,15 @@ void rdna3_attn_verify_wmma_kernel
     }
     for (int r = threadIdx.x; r < NRP; r += NTH) { mrow[r] = -INFINITY; lrow[r] = 0.0f; }
 
-    const float sm_scale = rsqrtf((float) HD) / 128.0f;
-    const size_t row_elems = (size_t) NKV * HD;
+    const float sm_scale = rsqrtf((float) HD) / (float) KMID;
     const int* bt = block_table + (size_t) batch * num_pages_per_seq;
-    const uint8_t* kc = (const uint8_t*) k_cache;
-    const uint8_t* vc = (const uint8_t*) v_cache;
+    const uint32_t* kc = (const uint32_t*) k_cache;
+    const uint32_t* vc = (const uint32_t*) v_cache;
 
-    uint4 pr[PER_T];
+    uint32_t pw[PER_S][8];                          // the packed words of a task's group (KB or VB of the 8)
     half ps[PER_S];
     auto fetch = [&] (int tb)
     {
-        #pragma unroll
-        for (int i = 0; i < PER_T; ++i)
-        {
-            const int c = threadIdx.x + i * NTH;
-            if (c < NCHUNK)
-            {
-                const int isv = c / (TB * CPR);
-                const int cc = c % (TB * CPR);
-                const int tk = cc / CPR, ch = cc % CPR;
-                const int t = min(tb + tk, n_end - 1);
-                const int tr = bt[t / PAGE] * PAGE + (t % PAGE);
-                pr[i] = *(const uint4*) ((isv ? vc : kc) + ((size_t) tr * row_elems + (size_t) kvh * HD) + ch * 16);
-            }
-        }
         #pragma unroll
         for (int i = 0; i < PER_S; ++i)
         {
@@ -552,30 +621,14 @@ void rdna3_attn_verify_wmma_kernel
                 const int t = min(tb + tk, n_end - 1);
                 const int tr = bt[t / PAGE] * PAGE + (t % PAGE);
                 ps[i] = (isv ? v_scales : k_scales)[(size_t) tr * (NKV * G) + kvh * G + g];
+                // isv is uniform per wave (TB * G is a multiple of the wave size)
+                if (isv) rdna3_attn::qc_load_words<VB>(vc + (size_t) tr * (NKV * G * VB) + (size_t) kvh * (G * VB) + (size_t) g * VB, pw[i]);
+                else rdna3_attn::qc_load_words<KB>(kc + (size_t) tr * (NKV * G * KB) + (size_t) kvh * (G * KB) + (size_t) g * KB, pw[i]);
             }
         }
     };
     auto commit = [&] ()
     {
-        #pragma unroll
-        for (int i = 0; i < PER_T; ++i)
-        {
-            const int c = threadIdx.x + i * NTH;
-            if (c < NCHUNK)
-            {
-                const int isv = c / (TB * CPR);
-                const int cc = c % (TB * CPR);
-                const int tk = cc / CPR, ch = cc % CPR;
-                if (isv)
-                {
-                    vtt[ch * 4 + 0][tk] = pr[i].x;
-                    vtt[ch * 4 + 1][tk] = pr[i].y;
-                    vtt[ch * 4 + 2][tk] = pr[i].z;
-                    vtt[ch * 4 + 3][tk] = pr[i].w;
-                }
-                else *(uint4*) &kt[tk][ch * 16] = pr[i];
-            }
-        }
         #pragma unroll
         for (int i = 0; i < PER_S; ++i)
         {
@@ -585,7 +638,21 @@ void rdna3_attn_verify_wmma_kernel
                 const int isv = c / (TB * G);
                 const int cc = c % (TB * G);
                 const int tk = cc / G, g = cc % G;
-                if (isv) vsc[g][tk] = ps[i]; else ksc[tk][g] = ps[i];
+                uint32_t w8[8];
+                if (isv) rdna3_attn::qc_unpack32<VB>(pw[i], w8);
+                else rdna3_attn::qc_unpack32<KB>(pw[i], w8);
+                if (isv)
+                {
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) vtt[g * 8 + k][tk] = w8[k];
+                    vsc[g][tk] = ps[i];
+                }
+                else
+                {
+                    *(uint4*) &kt[tk][g * 32] = make_uint4(w8[0], w8[1], w8[2], w8[3]);
+                    *(uint4*) &kt[tk][g * 32 + 16] = make_uint4(w8[4], w8[5], w8[6], w8[7]);
+                    ksc[tk][g] = ps[i];
+                }
             }
         }
     };
@@ -632,8 +699,8 @@ void rdna3_attn_verify_wmma_kernel
                     #pragma unroll
                     for (int i = 0; i < 4; ++i)
                     {
-                        bw[2 * i] = rdna3_attn::bytes_to_h2c(w4[i], 0x04010400u);
-                        bw[2 * i + 1] = rdna3_attn::bytes_to_h2c(w4[i], 0x04030402u);
+                        bw[2 * i] = rdna3_attn::bytes_to_h2c<KMID>(w4[i], 0x04010400u);
+                        bw[2 * i + 1] = rdna3_attn::bytes_to_h2c<KMID>(w4[i], 0x04030402u);
                     }
                     v16h b = *(v16h*) bw;
                     c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
@@ -718,12 +785,12 @@ void rdna3_attn_verify_wmma_kernel
                 #pragma unroll
                 for (int i = 0; i < 8; ++i)
                 {
-                    // 0x64bb halves (1024 + b) for tokens 2i, 2i + 1, then (b - 128) + 0.5 exactly, then scale
+                    // 0x64bb halves (1024 + b) for tokens 2i, 2i + 1, then (b - VMID) + 0.5 exactly, then scale
                     const uint32_t lo = (wv[2 * i] >> (8 * bsel)) & 0xffu;
                     const uint32_t hb = (wv[2 * i + 1] >> (8 * bsel)) & 0xffu;
                     const uint32_t hw = 0x64006400u | lo | (hb << 16);
                     half2 v = *reinterpret_cast<const half2*>(&hw);
-                    v = __hsub2(v, __float2half2_rn(1152.0f));
+                    v = __hsub2(v, __float2half2_rn((float) (1024 + VMID)));
                     v = __hadd2(v, __float2half2_rn(0.5f));
                     v = __hmul2(v, vs2[i]);
                     bw[i] = *reinterpret_cast<uint32_t*>(&v);
@@ -753,7 +820,7 @@ void rdna3_attn_verify_wmma_kernel
                 const int qi = gr / GROUP, hl = gr % GROUP;
                 const int hb = (hl * QL + qi) / BLOCK_ROWS, r16 = (hl * QL + qi) % BLOCK_ROWS;
                 const size_t pbase = ((size_t) (bh * H_BLOCKS + hb) * num_splits + split);
-                partial_o[(pbase * BLOCK_ROWS + r16) * HD + (warp * DTW + k) * 16 + l16] = oacc[rt][k][v] * (1.0f / 128.0f);   // 8-bit grid step
+                partial_o[(pbase * BLOCK_ROWS + r16) * HD + (warp * DTW + k) * 16 + l16] = oacc[rt][k][v] * (1.0f / (float) VMID);   // V grid step
             }
     for (int gr = threadIdx.x; gr < NR; gr += NTH)
     {
@@ -772,66 +839,87 @@ typedef void (*fp_rdna3_attn)(const half*, const void*, const void*, const int*,
 // One instance per (cache, head_dim, q_len, GQA group) with at most 64 query rows per kv head: verification on an
 // 8-bit cache (q_len 2..8, up to 48 rows, which bounds its LDS at head_dim 256) on matrix cores, everything else on
 // the split kernel
-template <int QC, int HD, int QL, int GROUP>
+template <int KB, int VB, int HD, int QL, int GROUP>
 static fp_rdna3_attn pick_one()
 {
     if constexpr (QL * GROUP > 64) return nullptr;
-    else if constexpr (QC == 8 && QL >= 2 && QL <= 8 && QL * GROUP <= 48) return rdna3_attn_verify_wmma_kernel<HD, QL, GROUP>;
-    else return rdna3_attn_decode_split_kernel<QC, HD, QL, GROUP>;
+    else if constexpr (KB > 0 && QL >= 2 && QL <= 8 && QL * GROUP <= 48) return rdna3_attn_verify_wmma_kernel<KB, VB, HD, QL, GROUP>;
+    else return rdna3_attn_decode_split_kernel<KB, VB, HD, QL, GROUP>;
 }
 
-template <int QC, int HD, int GROUP>
+template <int KB, int VB, int HD, int GROUP>
 static fp_rdna3_attn pick_ql(int ql)
 {
     switch (ql)
     {
-        case 1:  return pick_one<QC, HD, 1, GROUP>();
-        case 2:  return pick_one<QC, HD, 2, GROUP>();
-        case 3:  return pick_one<QC, HD, 3, GROUP>();
-        case 4:  return pick_one<QC, HD, 4, GROUP>();
-        case 5:  return pick_one<QC, HD, 5, GROUP>();
-        case 6:  return pick_one<QC, HD, 6, GROUP>();
-        case 7:  return pick_one<QC, HD, 7, GROUP>();
-        case 8:  return pick_one<QC, HD, 8, GROUP>();
-        case 9:  return pick_one<QC, HD, 9, GROUP>();
-        case 10: return pick_one<QC, HD, 10, GROUP>();
-        case 11: return pick_one<QC, HD, 11, GROUP>();
-        case 12: return pick_one<QC, HD, 12, GROUP>();
-        case 13: return pick_one<QC, HD, 13, GROUP>();
-        case 14: return pick_one<QC, HD, 14, GROUP>();
-        case 15: return pick_one<QC, HD, 15, GROUP>();
-        case 16: return pick_one<QC, HD, 16, GROUP>();
+        case 1:  return pick_one<KB, VB, HD, 1, GROUP>();
+        case 2:  return pick_one<KB, VB, HD, 2, GROUP>();
+        case 3:  return pick_one<KB, VB, HD, 3, GROUP>();
+        case 4:  return pick_one<KB, VB, HD, 4, GROUP>();
+        case 5:  return pick_one<KB, VB, HD, 5, GROUP>();
+        case 6:  return pick_one<KB, VB, HD, 6, GROUP>();
+        case 7:  return pick_one<KB, VB, HD, 7, GROUP>();
+        case 8:  return pick_one<KB, VB, HD, 8, GROUP>();
+        case 9:  return pick_one<KB, VB, HD, 9, GROUP>();
+        case 10: return pick_one<KB, VB, HD, 10, GROUP>();
+        case 11: return pick_one<KB, VB, HD, 11, GROUP>();
+        case 12: return pick_one<KB, VB, HD, 12, GROUP>();
+        case 13: return pick_one<KB, VB, HD, 13, GROUP>();
+        case 14: return pick_one<KB, VB, HD, 14, GROUP>();
+        case 15: return pick_one<KB, VB, HD, 15, GROUP>();
+        case 16: return pick_one<KB, VB, HD, 16, GROUP>();
     }
     return nullptr;
 }
 
-template <int QC, int HD>
+template <int KB, int VB, int HD>
 static fp_rdna3_attn pick_group(int group, int ql)
 {
     switch (group)
     {
-        case 2: return pick_ql<QC, HD, 2>(ql);
-        case 4: return pick_ql<QC, HD, 4>(ql);
-        case 6: return pick_ql<QC, HD, 6>(ql);
-        case 8: return pick_ql<QC, HD, 8>(ql);
+        case 2: return pick_ql<KB, VB, HD, 2>(ql);
+        case 4: return pick_ql<KB, VB, HD, 4>(ql);
+        case 6: return pick_ql<KB, VB, HD, 6>(ql);
+        case 8: return pick_ql<KB, VB, HD, 8>(ql);
     }
+    return nullptr;
+}
+
+// A quantized pair (kb, vb) is instantiated only if listed here; every pair costs ~26 s of compile per architecture, so
+// pairs other than 8/8 take q_len <= 8 (the draft windows MTP / n-gram / DFlash produce) and leave the rest to Triton
+template <int KB, int VB, int HD>
+static fp_rdna3_attn pick_pair(int group, int ql)
+{
+    if (KB != 8 && ql > 8) return nullptr;
+    return pick_group<KB, VB, HD>(group, ql);
+}
+
+template <int HD>
+static fp_rdna3_attn pick_hd(int kb, int vb, int group, int ql)
+{
+    if (kb == 0 && vb == 0) return pick_pair<0, 0, HD>(group, ql);
+    if (kb == 8 && vb == 8) return pick_pair<8, 8, HD>(group, ql);
+    if (kb == 6 && vb == 6) return pick_pair<6, 6, HD>(group, ql);
+    if (kb == 6 && vb == 4) return pick_pair<6, 4, HD>(group, ql);
+    if (kb == 5 && vb == 5) return pick_pair<5, 5, HD>(group, ql);
+    if (kb == 4 && vb == 4) return pick_pair<4, 4, HD>(group, ql);
     return nullptr;
 }
 
 #endif
 
-std::shared_ptr<TritonKernel> rdna3_attn_split_kernel(int qc, int head_dim, int q_len, int n_kv_heads, int group)
+std::shared_ptr<TritonKernel> rdna3_attn_split_kernel(int kb, int vb, int head_dim, int q_len, int n_kv_heads, int group)
 {
     #ifdef __HIP_PLATFORM_AMD__
         fp_rdna3_attn k = nullptr;
-        if (qc == 8 && head_dim == 256) k = pick_group<8, 256>(group, q_len);
-        if (qc == 0 && head_dim == 256) k = pick_group<0, 256>(group, q_len);
-        if (qc == 8 && head_dim == 128) k = pick_group<8, 128>(group, q_len);
-        if (qc == 0 && head_dim == 128) k = pick_group<0, 128>(group, q_len);
+        if (head_dim == 256) k = pick_hd<256>(kb, vb, group, q_len);
+        if (head_dim == 128) k = pick_hd<128>(kb, vb, group, q_len);
         if (!k || n_kv_heads < 1) return nullptr;
         hipFunction_t fn;
         cuda_check(hipGetFuncBySymbol(&fn, (const void*) k));
-        const int waves = q_len == 1 ? 4 : (qc == 8 && q_len <= 8) ? 8 : q_len;
+        // the wave count each kernel is built for (AttnGeom, or the WMMA verify kernel's 8)
+        const bool wmma = kb > 0 && q_len >= 2 && q_len <= 8 && q_len * group <= 48;
+        const int waves = q_len == 1 ? 4 : wmma ? 8 : q_len;
         // The kv head count rides in the first trailing scratch slot (unused by these kernels otherwise)
         return std::make_shared<TritonKernel>((void*) fn, std::string("rdna3_attn_decode_split"), waves, 0,
                                               (void*) (intptr_t) n_kv_heads);

@@ -360,15 +360,17 @@ class BCAttn:
         if ROCM and _rdna3_attn_enable and getattr(ext, "HAS_RDNA3_ATTN", False) and gfx_arch(dev).startswith("gfx11"):
             # Same arguments and partial layout as the Triton kernel, so the Triton combine reduces its
             # output. Covers causal full attention, no softcap / sinks, q_len <= 16, head_dim 128 / 256,
-            # fp16 or 8-bit K and V, softmax scale 1/sqrt(head_dim); reads the kv range in 32-token tiles
+            # fp16 or quantized K and V (the bit pairs instantiated in rdna3_attn.cu), softmax scale
+            # 1/sqrt(head_dim); reads the kv range in 32-token tiles
             kb, vb = (self.k_bits, self.v_bits) if self.quant else (0, 0)
             if (
                 causal and window_left < 0 and window_right < 0 and not self.softcap and
                 self.sinks is None and q_len <= 16 and hd in (128, 256) and hd_pad == hd and
-                self.v_head_dim == hd and kb == vb and kb in (0, 8) and
+                self.v_head_dim == hd and (kb == 0) == (vb == 0) and
                 abs(float(self.sm_scale) - hd ** -0.5) < 1e-6
             ):
-                k_split = ext.rdna3_attn_split_kernel(kb, hd, q_len, kvh, group_size)
+                # None when (kb, vb) is not one of the instantiated bit pairs: Triton keeps those
+                k_split = ext.rdna3_attn_split_kernel(kb, vb, hd, q_len, kvh, group_size)
             if k_split is not None:
                 # 32-token tiles, 16 kv splits per CU, at most 128 per program
                 block_n = 32
